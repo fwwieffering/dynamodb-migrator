@@ -11,7 +11,6 @@ import (
 )
 
 func pullItems(client *dynamodb.DynamoDB, srcTable string, itemChan chan []map[string]*dynamodb.AttributeValue, waitChan chan byte) {
-	// func pullItems(client *dynamodb.DynamoDB, srcTable string, itemChan chan []map[string]*dynamodb.AttributeValue) {
 	// paginate
 	lockChan := make(chan byte)
 	// dynamodb scanners
@@ -72,48 +71,61 @@ func generateBatchWriteInput(table string, items []map[string]*dynamodb.Attribut
 	return &dynamodb.BatchWriteItemInput{RequestItems: requestItems}, nil
 }
 
-func batchWriteItems(client *dynamodb.DynamoDB, table string, items []map[string]*dynamodb.AttributeValue, start int, end int, lockChan chan byte) {
-	input, err := generateBatchWriteInput(table, items[start:end])
+func batchWriteItems(client *dynamodb.DynamoDB, table string, items []map[string]*dynamodb.AttributeValue, start int, end int, lockChan chan byte, unprocessedItems chan map[string]*dynamodb.AttributeValue) {
+	input, _ := generateBatchWriteInput(table, items[start:end])
 	res, batchErr := client.BatchWriteItem(input)
 	// process unprocessed items
+	// retries 5 times
 	unprocessed := res.UnprocessedItems
-	for len(unprocessed) > 0 {
-		log.Printf("%d unprocessed items. Processing...", len(unprocessed))
-		res, err = client.BatchWriteItem(&dynamodb.BatchWriteItemInput{
-			RequestItems: unprocessed,
-		})
-		unprocessed = res.UnprocessedItems
-		if err != nil {
-			panic(err)
+	// skip retries for now, just gather them all up and PutItem at the end
+	// retries := 0
+	// for len(unprocessed) > 0 && retries < 5 {
+	// 	log.Printf("%d unprocessed items. Processing...", len(unprocessed))
+	// 	res, err = client.BatchWriteItem(&dynamodb.BatchWriteItemInput{
+	// 		RequestItems: unprocessed,
+	// 	})
+	// 	unprocessed = res.UnprocessedItems
+	// 	retries++
+	// 	if err != nil {
+	// 		panic(err)
+	// 	}
+	// }
+	// if retries == 3 && len(unprocessed) > 0 {
+	if len(unprocessed) > 0 {
+		log.Printf("Unable to process %d items", len(unprocessed))
+		for u := range unprocessed[table] {
+			unprocessedItems <- unprocessed[table][u].PutRequest.Item
 		}
 	}
 	if batchErr != nil {
-		panic(err)
+		panic(batchErr)
 	}
-	log.Printf("Stored items %d - %d in %s", start, end, table)
 	lockChan <- 1
 }
 
 func pushItems(client *dynamodb.DynamoDB, destTable string, itemChan chan []map[string]*dynamodb.AttributeValue, waitChan chan byte) {
-	// func pushItems(client *dynamodb.DynamoDB, destTable string, itemChan chan []map[string]*dynamodb.AttributeValue) {
 	// batchsize max is 25
 	batchSize := 15
 	lockChan := make(chan byte)
 	goroCount := 0
 	lastBatch := 0
+	counter := 0
+	unprocessedItems := make(chan map[string]*dynamodb.AttributeValue)
 
 	for itemList := range itemChan {
 		for i := range itemList {
+			counter++
 			if i%batchSize == 0 && i > 0 {
 				lastBatch = i
 				goroCount++
-				go batchWriteItems(client, destTable, itemList, i-batchSize, i, lockChan)
+				log.Printf("Dispatched items %d-%d for processing", counter-batchSize, counter)
+				go batchWriteItems(client, destTable, itemList, i-batchSize, i, lockChan, unprocessedItems)
 			} else if lastBatch+batchSize > len(itemList) {
 				_, err := client.PutItem(&dynamodb.PutItemInput{
 					TableName: &destTable,
 					Item:      itemList[i],
 				})
-				log.Printf("Stored item %d in %s", i, destTable)
+				log.Printf("Stored item %d in %s", counter, destTable)
 				if err != nil {
 					panic(err)
 				}
@@ -121,14 +133,20 @@ func pushItems(client *dynamodb.DynamoDB, destTable string, itemChan chan []map[
 		}
 	}
 	cleanUpThreads("PushItems", goroCount, lockChan)
+	close(unprocessedItems)
+	log.Printf("Cleaning up %d unprocessed items", len(unprocessedItems))
+	for i := range unprocessedItems {
+		client.PutItem(&dynamodb.PutItemInput{
+			TableName: &destTable,
+			Item:      i,
+		})
+	}
 	waitChan <- 1
 }
 
 func cleanUpThreads(source string, count int, channel chan byte) {
-	log.Printf("Cleaning up %s threads. %d total threads", source, count)
 	for i := 0; i < count; i++ {
 		<-channel
-		log.Printf("Closed %s thread %d of %d", source, i+1, count)
 	}
 }
 
@@ -152,6 +170,4 @@ func main() {
 	go pushItems(ddb, destTable, itemChan, waitChan)
 	<-waitChan
 	<-waitChan
-	// pullItems(ddb, sourceTable, itemChan)
-	// pushItems(ddb, destTable, itemChan)
 }
