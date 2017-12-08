@@ -25,8 +25,25 @@ func pullItems(client *dynamodb.DynamoDB, srcTable string, itemChan chan []map[s
 	waitChan <- 1
 }
 
+// makeBatches creates smaller arrays out of large arrays and appends to a channel
+func makeBatches(itemChan chan []map[string]*dynamodb.AttributeValue, itemList []map[string]*dynamodb.AttributeValue) {
+	batchSize := 15
+	lastBatch := 0
+	for item := range itemList {
+		if item%batchSize == 0 && item > 0 {
+			itemChan <- itemList[item-batchSize : item]
+			lastBatch = item
+		}
+	}
+	if lastBatch != len(itemList) {
+		itemChan <- itemList[lastBatch:]
+	}
+}
+
 func scanTable(client *dynamodb.DynamoDB, table string, shard int, totalShards int, itemChan chan []map[string]*dynamodb.AttributeValue, lockChan chan byte) {
 	counter := 1
+	itemCount := 0
+
 	res, err := client.Scan(&dynamodb.ScanInput{
 		ConsistentRead: aws.Bool(true),
 		Select:         aws.String("ALL_ATTRIBUTES"),
@@ -34,10 +51,15 @@ func scanTable(client *dynamodb.DynamoDB, table string, shard int, totalShards i
 		Segment:        aws.Int64(int64(shard)),
 		TotalSegments:  aws.Int64(int64(totalShards)),
 	})
+	itemCount = itemCount + len(res.Items)
+	makeBatches(itemChan, res.Items)
+
 	for len(res.LastEvaluatedKey) > 0 && err != nil {
 		log.Printf("Shard %d pulled page %d from %s", shard, counter, table)
 		counter++
-		itemChan <- res.Items
+		itemCount = itemCount + len(res.Items)
+		makeBatches(itemChan, res.Items)
+
 		res, err = client.Scan(&dynamodb.ScanInput{
 			ConsistentRead:    aws.Bool(true),
 			Select:            aws.String("ALL_ATTRIBUTES"),
@@ -51,8 +73,7 @@ func scanTable(client *dynamodb.DynamoDB, table string, shard int, totalShards i
 		panic(err)
 	}
 	// one last page
-	log.Printf("Shard %d finished pulling items from %s", shard, table)
-	itemChan <- res.Items
+	log.Printf("Shard %d finished pulled %d items from %s", shard, itemCount, table)
 	lockChan <- 1
 }
 
@@ -71,66 +92,53 @@ func generateBatchWriteInput(table string, items []map[string]*dynamodb.Attribut
 	return &dynamodb.BatchWriteItemInput{RequestItems: requestItems}, nil
 }
 
-func batchWriteItems(client *dynamodb.DynamoDB, table string, items []map[string]*dynamodb.AttributeValue, start int, end int, lockChan chan byte, unprocessedItems chan map[string]*dynamodb.AttributeValue) {
-	input, _ := generateBatchWriteInput(table, items[start:end])
+func batchWriteItems(client *dynamodb.DynamoDB, table string, items []map[string]*dynamodb.AttributeValue, lockChan chan byte, unprocessedItems chan map[string]*dynamodb.AttributeValue) {
+	input, err := generateBatchWriteInput(table, items)
+	if err != nil {
+		panic(err)
+	}
 	res, batchErr := client.BatchWriteItem(input)
+	if batchErr != nil {
+		panic(batchErr)
+	}
 	// process unprocessed items
-	// retries 5 times
+	// retries 3 times
 	unprocessed := res.UnprocessedItems
 	// skip retries for now, just gather them all up and PutItem at the end
-	// retries := 0
-	// for len(unprocessed) > 0 && retries < 5 {
-	// 	log.Printf("%d unprocessed items. Processing...", len(unprocessed))
-	// 	res, err = client.BatchWriteItem(&dynamodb.BatchWriteItemInput{
-	// 		RequestItems: unprocessed,
-	// 	})
-	// 	unprocessed = res.UnprocessedItems
-	// 	retries++
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// }
-	// if retries == 3 && len(unprocessed) > 0 {
-	if len(unprocessed) > 0 {
+	retries := 0
+	for len(unprocessed) > 0 && retries < 3 {
+		log.Printf("%d unprocessed items. Processing...", len(unprocessed))
+		res, err = client.BatchWriteItem(&dynamodb.BatchWriteItemInput{
+			RequestItems: unprocessed,
+		})
+		unprocessed = res.UnprocessedItems
+		retries++
+		if err != nil {
+			panic(err)
+		}
+	}
+	if retries == 3 && len(unprocessed) > 0 {
+		// if len(unprocessed) > 0 {
 		log.Printf("Unable to process %d items", len(unprocessed))
 		for u := range unprocessed[table] {
 			unprocessedItems <- unprocessed[table][u].PutRequest.Item
 		}
-	}
-	if batchErr != nil {
-		panic(batchErr)
 	}
 	lockChan <- 1
 }
 
 func pushItems(client *dynamodb.DynamoDB, destTable string, itemChan chan []map[string]*dynamodb.AttributeValue, waitChan chan byte) {
 	// batchsize max is 25
-	batchSize := 15
 	lockChan := make(chan byte)
 	goroCount := 0
-	lastBatch := 0
 	counter := 0
 	unprocessedItems := make(chan map[string]*dynamodb.AttributeValue)
 
 	for itemList := range itemChan {
-		for i := range itemList {
-			counter++
-			if i%batchSize == 0 && i > 0 {
-				lastBatch = i
-				goroCount++
-				log.Printf("Dispatched items %d-%d for processing", counter-batchSize, counter)
-				go batchWriteItems(client, destTable, itemList, i-batchSize, i, lockChan, unprocessedItems)
-			} else if lastBatch+batchSize > len(itemList) {
-				_, err := client.PutItem(&dynamodb.PutItemInput{
-					TableName: &destTable,
-					Item:      itemList[i],
-				})
-				log.Printf("Stored item %d in %s", counter, destTable)
-				if err != nil {
-					panic(err)
-				}
-			}
-		}
+		counter = counter + len(itemList)
+		goroCount++
+		log.Printf("Dispatched items %d-%d for processing", counter-len(itemList), counter)
+		go batchWriteItems(client, destTable, itemList, lockChan, unprocessedItems)
 	}
 	cleanUpThreads("PushItems", goroCount, lockChan)
 	close(unprocessedItems)
