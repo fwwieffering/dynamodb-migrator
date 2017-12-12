@@ -28,6 +28,8 @@ func getStatus(output *dynamodb.DescribeTableOutput) bool {
 	return active
 }
 
+// updateCapacity increases the read/write capacity of a table and all GlobalSecondaryIndexes
+// 3000 read/writes is probably too many for most cases but should give runway for large tables
 func updateCapacity(table string, readOrWrite string, client *dynamodb.DynamoDB) *dynamodb.UpdateTableInput {
 	// Get table throughput information
 	res, err := client.DescribeTable(&dynamodb.DescribeTableInput{
@@ -102,11 +104,11 @@ func updateCapacity(table string, readOrWrite string, client *dynamodb.DynamoDB)
 		}
 	}
 
+	// wait for table update to complete
 	updateRes, err := client.DescribeTable(&dynamodb.DescribeTableInput{
 		TableName: &table,
 	})
 
-	// wait for table update to complete
 	for !getStatus(updateRes) {
 		if err != nil {
 			panic(err)
@@ -122,6 +124,7 @@ func updateCapacity(table string, readOrWrite string, client *dynamodb.DynamoDB)
 	return &originalSettings
 }
 
+// pullItems sends off async scans of dynamodb table and writes the items to a channel
 func pullItems(client *dynamodb.DynamoDB, srcTable string, itemChan chan []map[string]*dynamodb.AttributeValue, waitChan chan byte) {
 	// paginate
 	lockChan := make(chan byte)
@@ -190,6 +193,7 @@ func scanTable(client *dynamodb.DynamoDB, table string, shard int, totalShards i
 	lockChan <- 1
 }
 
+// generateBatchWriteInput outputs the input for an aws BatchWriteItem command
 func generateBatchWriteInput(table string, items []map[string]*dynamodb.AttributeValue) (*dynamodb.BatchWriteItemInput, error) {
 	requestItems := make(map[string][]*dynamodb.WriteRequest)
 	if len(items) > 25 {
@@ -205,6 +209,7 @@ func generateBatchWriteInput(table string, items []map[string]*dynamodb.Attribut
 	return &dynamodb.BatchWriteItemInput{RequestItems: requestItems}, nil
 }
 
+// batchWriteItems executes an aws batchWriteItems command and handles the unprocessed items
 func batchWriteItems(client *dynamodb.DynamoDB, table string, items []map[string]*dynamodb.AttributeValue, concurrentThreads chan bool, lockChan chan byte, unprocessedItems chan map[string]*dynamodb.AttributeValue) {
 	input, err := generateBatchWriteInput(table, items)
 	if err != nil {
@@ -244,6 +249,8 @@ func batchWriteItems(client *dynamodb.DynamoDB, table string, items []map[string
 	lockChan <- 1
 }
 
+// pushItems creates many goroutines to write items to DynamoDB
+// the number of concurrent threads is limited by the maxThreads variable
 func pushItems(client *dynamodb.DynamoDB, destTable string, itemChan chan []map[string]*dynamodb.AttributeValue, waitChan chan byte) {
 	lockChan := make(chan byte)
 	goroCount := 0
@@ -283,6 +290,7 @@ func pushItems(client *dynamodb.DynamoDB, destTable string, itemChan chan []map[
 	waitChan <- 1
 }
 
+// cleanUpThreads is a syncing tool
 func cleanUpThreads(source string, count int, channel chan byte) {
 	log.Printf("Cleaning up %d threads for %s", count, source)
 	for i := 0; i < count; i++ {
