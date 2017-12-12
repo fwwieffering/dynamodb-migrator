@@ -28,13 +28,23 @@ func getStatus(output *dynamodb.DescribeTableOutput) bool {
 	return active
 }
 
-func updateWriteCapacity(table string, client *dynamodb.DynamoDB) *dynamodb.UpdateTableInput {
+func updateCapacity(table string, readOrWrite string, client *dynamodb.DynamoDB) *dynamodb.UpdateTableInput {
 	// Get table throughput information
 	res, err := client.DescribeTable(&dynamodb.DescribeTableInput{
 		TableName: &table,
 	})
 	if err != nil {
 		panic(err)
+	}
+	var readCapacity *int64
+	var writeCapacity *int64
+
+	if readOrWrite == "write" {
+		readCapacity = res.Table.ProvisionedThroughput.ReadCapacityUnits
+		writeCapacity = aws.Int64(3000)
+	} else {
+		readCapacity = aws.Int64(3000)
+		writeCapacity = res.Table.ProvisionedThroughput.WriteCapacityUnits
 	}
 	originalSettings := dynamodb.UpdateTableInput{
 		TableName: &table,
@@ -43,23 +53,29 @@ func updateWriteCapacity(table string, client *dynamodb.DynamoDB) *dynamodb.Upda
 			WriteCapacityUnits: res.Table.ProvisionedThroughput.WriteCapacityUnits,
 		},
 	}
-	// set write to 3000, just because
 	newSettings := dynamodb.UpdateTableInput{
 		TableName: &table,
 		ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
-			WriteCapacityUnits: aws.Int64(3000),
-			ReadCapacityUnits:  aws.Int64(1000),
+			WriteCapacityUnits: writeCapacity,
+			ReadCapacityUnits:  readCapacity,
 		},
 	}
 	// Collect global secondary indexes and increase capacity as well
 	for i := range res.Table.GlobalSecondaryIndexes {
-		if res.Table.GlobalSecondaryIndexes[i].ProvisionedThroughput.WriteCapacityUnits != aws.Int64(3000) {
+		if readOrWrite == "write" {
+			readCapacity = res.Table.ProvisionedThroughput.ReadCapacityUnits
+			writeCapacity = aws.Int64(3000)
+		} else {
+			readCapacity = aws.Int64(3000)
+			writeCapacity = res.Table.ProvisionedThroughput.WriteCapacityUnits
+		}
+		if res.Table.GlobalSecondaryIndexes[i].ProvisionedThroughput.WriteCapacityUnits != writeCapacity || res.Table.GlobalSecondaryIndexes[i].ProvisionedThroughput.ReadCapacityUnits != readCapacity {
 			newSettings.GlobalSecondaryIndexUpdates = append(newSettings.GlobalSecondaryIndexUpdates, &dynamodb.GlobalSecondaryIndexUpdate{
 				Update: &dynamodb.UpdateGlobalSecondaryIndexAction{
 					IndexName: res.Table.GlobalSecondaryIndexes[i].IndexName,
 					ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
-						WriteCapacityUnits: aws.Int64(3000),
-						ReadCapacityUnits:  aws.Int64(1000),
+						WriteCapacityUnits: writeCapacity,
+						ReadCapacityUnits:  readCapacity,
 					},
 				},
 			})
@@ -85,6 +101,7 @@ func updateWriteCapacity(table string, client *dynamodb.DynamoDB) *dynamodb.Upda
 			panic(err)
 		}
 	}
+
 	updateRes, err := client.DescribeTable(&dynamodb.DescribeTableInput{
 		TableName: &table,
 	})
@@ -188,7 +205,7 @@ func generateBatchWriteInput(table string, items []map[string]*dynamodb.Attribut
 	return &dynamodb.BatchWriteItemInput{RequestItems: requestItems}, nil
 }
 
-func batchWriteItems(client *dynamodb.DynamoDB, table string, items []map[string]*dynamodb.AttributeValue, lockChan chan byte, unprocessedItems chan map[string]*dynamodb.AttributeValue) {
+func batchWriteItems(client *dynamodb.DynamoDB, table string, items []map[string]*dynamodb.AttributeValue, concurrentThreads chan bool, lockChan chan byte, unprocessedItems chan map[string]*dynamodb.AttributeValue) {
 	input, err := generateBatchWriteInput(table, items)
 	if err != nil {
 		panic(err)
@@ -211,6 +228,8 @@ func batchWriteItems(client *dynamodb.DynamoDB, table string, items []map[string
 		if err != nil {
 			panic(err)
 		}
+		// try not to overload tables
+		time.Sleep(1 * time.Second)
 	}
 	if retries == 3 && len(unprocessed) > 0 {
 		log.Printf("Unable to process %d items", len(unprocessed))
@@ -219,21 +238,32 @@ func batchWriteItems(client *dynamodb.DynamoDB, table string, items []map[string
 			unprocessedItems <- unprocessed[table][u].PutRequest.Item
 		}
 	}
+	// free up room for another thread
+	concurrentThreads <- true
+	// for syncing
 	lockChan <- 1
 }
 
 func pushItems(client *dynamodb.DynamoDB, destTable string, itemChan chan []map[string]*dynamodb.AttributeValue, waitChan chan byte) {
-	// batchsize max is 25
 	lockChan := make(chan byte)
 	goroCount := 0
 	counter := 0
 	unprocessedItems := make(chan map[string]*dynamodb.AttributeValue, 100000)
 
+	// limit concurrency through use of buffered channel
+	maxThreads := 30
+	concurrentThreads := make(chan bool, maxThreads)
+
+	for i := 0; i < maxThreads; i++ {
+		concurrentThreads <- true
+	}
+
 	for itemList := range itemChan {
-		counter = counter + len(itemList)
 		goroCount++
-		log.Printf("Dispatched items %d-%d for processing", counter-len(itemList), counter)
-		go batchWriteItems(client, destTable, itemList, lockChan, unprocessedItems)
+		counter = counter + len(itemList)
+		<-concurrentThreads
+		log.Printf("Thread %d/%d Dispatched items %d-%d for processing", maxThreads-len(concurrentThreads), maxThreads, counter-len(itemList), counter)
+		go batchWriteItems(client, destTable, itemList, concurrentThreads, lockChan, unprocessedItems)
 	}
 	cleanUpThreads("PushItems", goroCount, lockChan)
 	close(unprocessedItems)
@@ -277,12 +307,17 @@ func main() {
 		Region: aws.String("us-east-1"),
 	}))
 	log.Printf("Increasing table %s write capacity to 3000 for table and all GSIs", destTable)
-	origSettings := updateWriteCapacity(destTable, ddb)
+	destOrigSettings := updateCapacity(destTable, "write", ddb)
+	log.Printf("Increasing table %s read capacity to 3000 for table and all GSIs", sourceTable)
+	srcOrigSettings := updateCapacity(sourceTable, "read", ddb)
 	log.Println("Pulling items from source table")
 	go pullItems(ddb, sourceTable, itemChan, waitChan)
 	go pushItems(ddb, destTable, itemChan, waitChan)
 	<-waitChan
 	<-waitChan
 	log.Printf("Knocking table %s write capacity back down to original settings", destTable)
-	ddb.UpdateTable(origSettings)
+	ddb.UpdateTable(destOrigSettings)
+	log.Printf("Knocking table %s read capacity back down to original settings", sourceTable)
+	ddb.UpdateTable(srcOrigSettings)
+
 }
