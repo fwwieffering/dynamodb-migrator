@@ -14,5 +14,6 @@ dynamodb-migrator
 ## A couple things to consider
 - This does no transformation of the data. Indexes / Attributes must be the same across tables
 - The program assumes whatever IAM credentials are provided to the environment it runs in. It will need `dynamodb:Scan` permissions on the source table and `dynamodb:BatchWriteItem, dynamodb:PutItem` permissions on the destination table
+- The script increases the writecapacity of the table and all indexes to 3000, then knocks it back down to the original settings after running. Allocating all this write can take a while and the table will be expensive while it has this write capacity
 - There is very little error handling. If you hit a provisioned throughput error, it will fail. AWS automatically retries this but depending on the amount of data you are dealing with you may need to increase read/write capacity on your tables (or implement autoscaling of your dynamo tables)
 - You can run this multiple times but items will not be updated as `BatchWriteItem` does not do updates
