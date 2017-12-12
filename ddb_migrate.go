@@ -48,7 +48,7 @@ func updateWriteCapacity(table string, client *dynamodb.DynamoDB) *dynamodb.Upda
 		TableName: &table,
 		ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
 			WriteCapacityUnits: aws.Int64(3000),
-			ReadCapacityUnits:  res.Table.ProvisionedThroughput.ReadCapacityUnits,
+			ReadCapacityUnits:  aws.Int64(1000),
 		},
 	}
 	// Collect global secondary indexes and increase capacity as well
@@ -59,7 +59,7 @@ func updateWriteCapacity(table string, client *dynamodb.DynamoDB) *dynamodb.Upda
 					IndexName: res.Table.GlobalSecondaryIndexes[i].IndexName,
 					ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
 						WriteCapacityUnits: aws.Int64(3000),
-						ReadCapacityUnits:  res.Table.GlobalSecondaryIndexes[i].ProvisionedThroughput.ReadCapacityUnits,
+						ReadCapacityUnits:  aws.Int64(1000),
 					},
 				},
 			})
