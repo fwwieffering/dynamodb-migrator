@@ -2,35 +2,68 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 )
 
 // Checks if DescribeTableOutput is active or not
-func getStatus(output *dynamodb.DescribeTableOutput) bool {
-	active := true
-	if *output.Table.TableStatus != "ACTIVE" {
-		active = false
-		return active
+func updateTable(client *dynamodb.DynamoDB, table string, input *dynamodb.UpdateTableInput) {
+	_, err := client.UpdateTable(input)
+	if err != nil {
+		if strings.Contains(err.Error(), "will not change") {
+			log.Printf("No updates to be made")
+		} else if strings.Contains(err.Error(), "is being updated") {
+			log.Printf("Update already in progress")
+		} else {
+			panic(err)
+		}
 	}
-	for i := range output.Table.GlobalSecondaryIndexes {
-		if *output.Table.GlobalSecondaryIndexes[i].IndexStatus != "ACTIVE" {
+
+	// wait for table update to complete
+	updateRes, err := client.DescribeTable(&dynamodb.DescribeTableInput{
+		TableName: &table,
+	})
+
+	// parses describetable output
+	getStatus := func(output *dynamodb.DescribeTableOutput) bool {
+		active := true
+		if *output.Table.TableStatus != "ACTIVE" {
 			active = false
 			return active
 		}
+		for i := range output.Table.GlobalSecondaryIndexes {
+			if *output.Table.GlobalSecondaryIndexes[i].IndexStatus != "ACTIVE" {
+				active = false
+				return active
+			}
+		}
+		return active
 	}
-	return active
+
+	for !getStatus(updateRes) {
+		if err != nil {
+			panic(err)
+		}
+		log.Printf("Waiting for table update to complete....")
+		updateRes, err = client.DescribeTable(&dynamodb.DescribeTableInput{
+			TableName: &table,
+		})
+		time.Sleep(5 * time.Second)
+	}
+	log.Printf("Table update complete. Table in status %s", *updateRes.Table.TableStatus)
 }
 
 // updateCapacity increases the read/write capacity of a table and all GlobalSecondaryIndexes
 // 3000 read/writes is probably too many for most cases but should give runway for large tables
-func updateCapacity(table string, readOrWrite string, client *dynamodb.DynamoDB) *dynamodb.UpdateTableInput {
+func increaseTableCapacity(table string, readOrWrite string, client *dynamodb.DynamoDB) *dynamodb.UpdateTableInput {
 	// Get table throughput information
 	res, err := client.DescribeTable(&dynamodb.DescribeTableInput{
 		TableName: &table,
@@ -93,33 +126,7 @@ func updateCapacity(table string, readOrWrite string, client *dynamodb.DynamoDB)
 		}
 	}
 
-	_, err = client.UpdateTable(&newSettings)
-	if err != nil {
-		if strings.Contains(err.Error(), "will not change") {
-			log.Printf("No updates to be made")
-		} else if strings.Contains(err.Error(), "is being updated") {
-			log.Printf("Update already in progress")
-		} else {
-			panic(err)
-		}
-	}
-
-	// wait for table update to complete
-	updateRes, err := client.DescribeTable(&dynamodb.DescribeTableInput{
-		TableName: &table,
-	})
-
-	for !getStatus(updateRes) {
-		if err != nil {
-			panic(err)
-		}
-		log.Printf("Waiting for table update to complete....")
-		updateRes, err = client.DescribeTable(&dynamodb.DescribeTableInput{
-			TableName: &table,
-		})
-		time.Sleep(5 * time.Second)
-	}
-	log.Printf("Table update complete. Table in status %s", *updateRes.Table.TableStatus)
+	updateTable(client, table, &newSettings)
 
 	return &originalSettings
 }
@@ -294,9 +301,35 @@ func pushItems(client *dynamodb.DynamoDB, destTable string, itemChan chan []map[
 func cleanUpThreads(source string, count int, channel chan byte) {
 	log.Printf("Cleaning up %d threads for %s", count, source)
 	for i := 0; i < count; i++ {
-		log.Printf("Cleaned up thread %d of %d for %s", i, count, source)
+		log.Printf("Cleaned up thread %d of %d for %s", i+1, count, source)
 		<-channel
 	}
+}
+
+// returns dynamodb clients for source/dest tables
+// if SOURCE_ACCOUNT, DESTINATION_ACCOUNT, CROSS_ACCOUNT_ROLE env vars are provided
+// clients will point to different accounts. Otherwise default credentials are used
+func generateClients(region string) (*dynamodb.DynamoDB, *dynamodb.DynamoDB) {
+	srcAcct, srcAcctPresent := os.LookupEnv("SOURCE_ACCOUNT")
+	destAcct, destAcctPresent := os.LookupEnv("DESTINATION_ACCOUNT")
+	role, rolePresent := os.LookupEnv("CROSS_ACCOUNT_ROLE")
+
+	var srcClient *dynamodb.DynamoDB
+	var destClient *dynamodb.DynamoDB
+
+	if rolePresent && destAcctPresent && srcAcctPresent {
+		log.Printf("Assuming cross account role %s", role)
+		srcRole := fmt.Sprintf("arn:aws:iam::%s:role/%s", srcAcct, role)
+		destRole := fmt.Sprintf("arn:aws:iam::%s:role/%s", destAcct, role)
+		sess := session.Must(session.NewSession(&aws.Config{Region: &region}))
+		srcClient = dynamodb.New(sess, &aws.Config{Credentials: stscreds.NewCredentials(sess, srcRole)})
+		destClient = dynamodb.New(sess, &aws.Config{Credentials: stscreds.NewCredentials(sess, destRole)})
+	} else {
+		log.Printf("Using default credentials")
+		srcClient = dynamodb.New(session.New(&aws.Config{Region: &region}))
+		destClient = dynamodb.New(session.New(&aws.Config{Region: &region}))
+	}
+	return srcClient, destClient
 }
 
 func main() {
@@ -308,24 +341,26 @@ func main() {
 	if !present {
 		panic("DESTINATION_TABLE environment variable must be defined")
 	}
+	region, present := os.LookupEnv("AWS_REGION")
+	if !present {
+		region = "us-east-1"
+	}
 	log.Printf("Dynamodb migration from %s to %s", sourceTable, destTable)
 	itemChan := make(chan []map[string]*dynamodb.AttributeValue)
 	waitChan := make(chan byte, 2)
-	ddb := dynamodb.New(session.New(&aws.Config{
-		Region: aws.String("us-east-1"),
-	}))
+	srcDdb, destDdb := generateClients(region)
 	log.Printf("Increasing table %s write capacity to 3000 for table and all GSIs", destTable)
-	destOrigSettings := updateCapacity(destTable, "write", ddb)
+	destOrigSettings := increaseTableCapacity(destTable, "write", destDdb)
 	log.Printf("Increasing table %s read capacity to 3000 for table and all GSIs", sourceTable)
-	srcOrigSettings := updateCapacity(sourceTable, "read", ddb)
+	srcOrigSettings := increaseTableCapacity(sourceTable, "read", srcDdb)
 	log.Println("Pulling items from source table")
-	go pullItems(ddb, sourceTable, itemChan, waitChan)
-	go pushItems(ddb, destTable, itemChan, waitChan)
+	go pullItems(srcDdb, sourceTable, itemChan, waitChan)
+	go pushItems(destDdb, destTable, itemChan, waitChan)
 	<-waitChan
 	<-waitChan
 	log.Printf("Knocking table %s write capacity back down to original settings", destTable)
-	ddb.UpdateTable(destOrigSettings)
+	updateTable(destDdb, destTable, destOrigSettings)
 	log.Printf("Knocking table %s read capacity back down to original settings", sourceTable)
-	ddb.UpdateTable(srcOrigSettings)
+	updateTable(srcDdb, sourceTable, srcOrigSettings)
 
 }
