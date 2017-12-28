@@ -1,20 +1,21 @@
 package main
 
 import (
-	"os"
+	"errors"
 	"fmt"
 	"log"
-	"errors"
+	"os"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 )
 
 // returns dynamodb clients for source/dest tables
 // if SOURCE_ACCOUNT, DESTINATION_ACCOUNT, CROSS_ACCOUNT_ROLE env vars are provided
 // clients will point to different accounts. Otherwise default credentials are used
+// not sure how to write a unit test for this
 func generateClients(region string) (*dynamodb.DynamoDB, *dynamodb.DynamoDB) {
 	srcAcct, srcAcctPresent := os.LookupEnv("SOURCE_ACCOUNT")
 	destAcct, destAcctPresent := os.LookupEnv("DESTINATION_ACCOUNT")

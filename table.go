@@ -35,6 +35,7 @@ func (t *Table) UpdateTable(input *dynamodb.UpdateTableInput) {
 	if err != nil {
 		if strings.Contains(err.Error(), "will not change") {
 			log.Printf("No updates to be made")
+			return
 		} else if strings.Contains(err.Error(), "is being updated") {
 			log.Printf("Update already in progress")
 		} else {
@@ -248,10 +249,7 @@ func (t *Table) PushItems(itemChan chan []map[string]*dynamodb.AttributeValue, w
 // BatchWriteItems executes an aws batchWriteItems command and handles the unprocessed items
 // Unprocessed items are retried 3 times and then appended to a channel to be processed later
 func (t *Table) BatchWriteItems(items []map[string]*dynamodb.AttributeValue, concurrentThreads chan bool, lockChan chan byte, unprocessedItems chan map[string]*dynamodb.AttributeValue) {
-	input, err := generateBatchWriteInput(t.Name, items)
-	if err != nil {
-		panic(err)
-	}
+	input, _ := generateBatchWriteInput(t.Name, items)
 	res, batchErr := t.Client.BatchWriteItem(input)
 	if batchErr != nil {
 		panic(batchErr)
@@ -262,7 +260,7 @@ func (t *Table) BatchWriteItems(items []map[string]*dynamodb.AttributeValue, con
 	retries := 0
 	for len(unprocessed) > 0 && retries < 3 {
 		log.Printf("%d unprocessed items. Processing...", len(unprocessed))
-		res, err = t.Client.BatchWriteItem(&dynamodb.BatchWriteItemInput{
+		res, err := t.Client.BatchWriteItem(&dynamodb.BatchWriteItemInput{
 			RequestItems: unprocessed,
 		})
 		unprocessed = res.UnprocessedItems
