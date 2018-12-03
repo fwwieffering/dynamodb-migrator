@@ -148,7 +148,7 @@ func TestScan(t *testing.T) {
 	tab.ScanTable(1, 1, lockChan)
 	<-lockChan
 	close(tab.ItemChan)
-	if tab.ItemCount != 110 {
+	if tab.ItemCount.Count != 110 {
 		t.Errorf("Item count should be 20 after scan table call")
 	}
 	if len(tab.ItemChan) != 8 {
@@ -199,7 +199,7 @@ func TestPullItems(t *testing.T) {
 	lockChan := make(chan byte, 1)
 	tab.PullItems(lockChan)
 	<-lockChan
-	if tab.ItemCount != 500 {
+	if tab.ItemCount.Count != 500 {
 		t.Errorf("item count should be 500. Is: %d", tab.ItemCount)
 	}
 }

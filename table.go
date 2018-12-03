@@ -14,7 +14,7 @@ import (
 type Table struct {
 	Name      string
 	Client    dynamodbiface.DynamoDBAPI
-	ItemCount int
+	ItemCount *ItemCount
 	ItemChan  chan []map[string]*dynamodb.AttributeValue
 }
 
@@ -23,7 +23,7 @@ func NewTable(client dynamodbiface.DynamoDBAPI, name string) *Table {
 	return &Table{
 		Name:      name,
 		Client:    client,
-		ItemCount: 0,
+		ItemCount: NewItemCount(),
 		ItemChan:  make(chan []map[string]*dynamodb.AttributeValue),
 	}
 }
@@ -31,7 +31,7 @@ func NewTable(client dynamodbiface.DynamoDBAPI, name string) *Table {
 // PullItems sends off async scans of dynamodb table and writes the items to a channel
 func (t *Table) PullItems(waitChan chan byte) {
 	// set table item count to 0, will be refreshed after items are pulled
-	t.ItemCount = 0
+	t.ItemCount.Set(0)
 	lockChan := make(chan byte)
 	// dynamodb scanners
 	shards := 5
@@ -59,9 +59,9 @@ func (t *Table) ScanTable(shard int, totalShards int, lockChan chan byte) {
 	})
 
 	for len(res.LastEvaluatedKey) > 0 && err == nil {
-		log.Printf("Shard %d pulled page %d from %s", shard, counter, t.Name)
+		log.Infoln(fmt.Sprintf("Shard %d pulled page %d from %s", shard, counter, t.Name))
 		counter++
-		t.ItemCount = t.ItemCount + len(res.Items)
+		t.ItemCount.Add(len(res.Items))
 		makeBatches(t.ItemChan, res.Items)
 
 		res, err = handleScanProvisionedThroughput(t.Client, &dynamodb.ScanInput{
@@ -77,10 +77,10 @@ func (t *Table) ScanTable(shard int, totalShards int, lockChan chan byte) {
 		panic(err)
 	}
 
-	t.ItemCount = t.ItemCount + len(res.Items)
+	t.ItemCount.Add(len(res.Items))
 	makeBatches(t.ItemChan, res.Items)
 
-	log.Printf("Shard %d finished pulling items from %s", shard, t.Name)
+	log.Infoln(fmt.Sprintf("Shard %d finished pulling items from %s", shard, t.Name))
 	lockChan <- 1
 }
 
@@ -103,17 +103,17 @@ func (t *Table) PushItems(itemChan chan []map[string]*dynamodb.AttributeValue, w
 	cleanUpThreads("PushItems", maxThreads, lockChan)
 
 	close(unprocessedItems)
-	log.Printf("Cleaning up %d unprocessed items", len(unprocessedItems))
+	log.Infoln(fmt.Sprintf("Cleaning up %d unprocessed items", len(unprocessedItems)))
 	counter := 0
 	for i := range unprocessedItems {
 		counter++
-		log.Printf("Storing unprocessed item %d", counter)
+		log.Infoln(fmt.Sprintf("Storing unprocessed item %d", counter))
 		_, err := t.Client.PutItem(&dynamodb.PutItemInput{
 			TableName: &t.Name,
 			Item:      i,
 		})
 		if err != nil {
-			log.Printf("%+v", err)
+			log.Errorln(fmt.Sprintf("%+v", err))
 		}
 	}
 	waitChan <- 1

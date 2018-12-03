@@ -120,3 +120,17 @@ func NewItemCount() *ItemCount {
 		Count: 0,
 	}
 }
+
+// Set sets ItemCount.Count to provided val
+func (i *ItemCount) Set(val int) {
+	i.Lock.Lock()
+	i.Count = val
+	i.Lock.Unlock()
+}
+
+// Add adds val to ItemCount.Count
+func (i *ItemCount) Add(val int) {
+	i.Lock.Lock()
+	i.Count = i.Count + val
+	i.Lock.Unlock()
+}
