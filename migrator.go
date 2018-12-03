@@ -1,9 +1,10 @@
 package main
 
 import (
-	"log"
+	"fmt"
 
 	"github.com/aws/aws-sdk-go/service/dynamodb"
+	log "github.com/sirupsen/logrus"
 )
 
 // MigratorConfig holds the configuration for the migrator struct
@@ -21,36 +22,63 @@ type MigratorConfig struct {
 
 // Migrator executes the dynamodb migration
 type Migrator struct {
-	Config *MigratorConfig
+	SourceTable *Table
+	DestTable   *Table
+	Config      *MigratorConfig
 }
 
-// Run runs the dynamodb migration
-func (m *Migrator) Run() error {
-	waitChan := make(chan byte, 2)
-
+// NewMigrator generates a new Migrator struct with the provided MigratorConfig
+func NewMigrator(c *MigratorConfig) *Migrator {
+	log.Infoln("Generating AWS Credentials")
 	var srcDdb *dynamodb.DynamoDB
 	var destDdb *dynamodb.DynamoDB
-	if len(m.Config.Role) > 0 {
-		srcDdb = generateClientRole(m.Config.SourceRegion, m.Config.SourceAccount, m.Config.Role)
-		destDdb = generateClientRole(m.Config.DestRegion, m.Config.DestAccount, m.Config.Role)
+	if len(c.Role) > 0 {
+		log.Infoln(fmt.Sprintf("Assuming cross account role %s for accounts %s and %s", c.Role, c.SourceAccount, c.DestAccount))
+		srcDdb = generateClientRole(c.SourceRegion, c.SourceAccount, c.Role)
+		destDdb = generateClientRole(c.DestRegion, c.DestAccount, c.Role)
 	} else {
-		srcDdb = generateClient(m.Config.SourceRegion)
-		destDdb = generateClient(m.Config.DestRegion)
+		srcDdb = generateClient(c.SourceRegion)
+		destDdb = generateClient(c.DestRegion)
 	}
-	srcTable := NewTable(srcDdb, m.Config.SourceTable)
-	destTable := NewTable(destDdb, m.Config.DestTable)
+	return &Migrator{
+		SourceTable: NewTable(srcDdb, c.SourceTable),
+		DestTable:   NewTable(destDdb, c.DestTable),
+		Config:      c,
+	}
+}
 
-	log.Println("Pulling items from source table")
-	go srcTable.PullItems(waitChan)
-	go destTable.PushItems(srcTable.ItemChan, waitChan)
+// Migrate Run runs the dynamodb migration from SourceTable to DestTable
+func (m *Migrator) Migrate() error {
+	waitChan := make(chan byte, 2)
+
+	log.Infoln("Pulling items from source table...")
+	go m.SourceTable.PullItems(waitChan)
+	go m.DestTable.PushItems(m.SourceTable.ItemChan, waitChan)
 	<-waitChan
 	<-waitChan
 	// get count of dest items
-	destTable.PullItems(waitChan)
+	m.DestTable.CountItems(waitChan)
 	<-waitChan
-	log.Printf("Migration complete.")
-	log.Printf("Items in %s: %d", m.Config.SourceTable, srcTable.ItemCount)
-	log.Printf("Items in %s: %d", m.Config.DestTable, destTable.ItemCount)
+	fmt.Println("--------------------------------------------------------------------------------------")
+	fmt.Println("Migration complete.")
+	fmt.Println(fmt.Sprintf("SOURCE TABLE items in %s: %d", m.SourceTable.Name, m.SourceTable.ItemCount.Count))
+	fmt.Println(fmt.Sprintf("DESTINATION TABLE Items in %s: %d", m.DestTable.Name, m.DestTable.ItemCount.Count))
+
+	return nil
+}
+
+// Compare checks Item count in source and destination table
+func (m *Migrator) Compare() error {
+	waitChan := make(chan byte, 2)
+	log.Infoln("Pulling items from source table and destination tables...")
+	go m.SourceTable.CountItems(waitChan)
+	go m.DestTable.CountItems(waitChan)
+	<-waitChan
+	<-waitChan
+	fmt.Println("--------------------------------------------------------------------------------------")
+	fmt.Println("Compare complete")
+	fmt.Println(fmt.Sprintf("SOURCE TABLE items in %s: %d", m.SourceTable.Name, m.SourceTable.ItemCount.Count))
+	fmt.Println(fmt.Sprintf("DESTINATION TABLE Items in %s: %d", m.DestTable.Name, m.DestTable.ItemCount.Count))
 
 	return nil
 }

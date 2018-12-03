@@ -9,13 +9,8 @@ import (
 	"github.com/urfave/cli"
 )
 
-func initApp() *cli.App {
-	app := cli.NewApp()
-	app.Name = "dynamodb-migrator"
-	app.Usage = "Migrate data from one dynamodb table to another"
-	app.Version = fmt.Sprintf("0.1.0")
-
-	mainFlag := []cli.Flag{
+func defaultFlags() []cli.Flag {
+	return []cli.Flag{
 		cli.StringFlag{
 			Name:   "source-table, st",
 			Value:  "",
@@ -65,15 +60,9 @@ func initApp() *cli.App {
 			EnvVar: "PLUGIN_LOG_LEVEL,LOG_LEVEL",
 		},
 	}
-
-	app.Flags = mainFlag
-
-	app.Action = cli.ActionFunc(defaultAction)
-
-	return app
 }
 
-func defaultAction(c *cli.Context) error {
+func parseParams(c *cli.Context) error {
 	logLevelString := c.String("log-level")
 	logLevel, err := log.ParseLevel(logLevelString)
 	if err != nil {
@@ -93,18 +82,74 @@ func defaultAction(c *cli.Context) error {
 		return errors.New("If any of [source-account, destination-account, role] flags are provided all must be provided")
 	}
 
-	migrator := &Migrator{
-		Config: &MigratorConfig{
-			SourceTable:   c.String("source-table"),
-			SourceRegion:  c.String("source-region"),
-			SourceAccount: c.String("source-account"),
-			DestTable:     c.String("destination-table"),
-			DestRegion:    c.String("destination-region"),
-			DestAccount:   c.String("destination-account"),
-			Role:          c.String("role"),
+	return nil
+}
+
+func initApp() *cli.App {
+	app := cli.NewApp()
+	app.Name = "dynamodb-migrator"
+	app.Usage = "Migrate data from one dynamodb table to another"
+	app.Version = fmt.Sprintf("0.1.0")
+
+	app.Flags = defaultFlags()
+
+	app.Action = cli.ActionFunc(defaultAction)
+
+	app.Commands = []cli.Command{
+		{
+			Name:   "migrate",
+			Action: defaultAction,
+			Usage:  "Migrates data from Source Table to Destination Table",
+			Flags:  defaultFlags(),
+		},
+		{
+			Name:   "compare",
+			Action: compare,
+			Usage:  "Compares item counts from Source Table and Destination Table",
+			Flags:  defaultFlags(),
 		},
 	}
-	return migrator.Run()
+
+	return app
+}
+
+func defaultAction(c *cli.Context) error {
+	err := parseParams(c)
+
+	if err != nil {
+		return err
+	}
+
+	migrator := NewMigrator(&MigratorConfig{
+		SourceTable:   c.String("source-table"),
+		SourceRegion:  c.String("source-region"),
+		SourceAccount: c.String("source-account"),
+		DestTable:     c.String("destination-table"),
+		DestRegion:    c.String("destination-region"),
+		DestAccount:   c.String("destination-account"),
+		Role:          c.String("role"),
+	})
+	return migrator.Migrate()
+}
+
+func compare(c *cli.Context) error {
+	err := parseParams(c)
+
+	if err != nil {
+		return err
+	}
+
+	migrator := NewMigrator(&MigratorConfig{
+		SourceTable:   c.String("source-table"),
+		SourceRegion:  c.String("source-region"),
+		SourceAccount: c.String("source-account"),
+		DestTable:     c.String("destination-table"),
+		DestRegion:    c.String("destination-region"),
+		DestAccount:   c.String("destination-account"),
+		Role:          c.String("role"),
+	})
+
+	return migrator.Compare()
 }
 
 func main() {
