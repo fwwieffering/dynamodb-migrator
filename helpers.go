@@ -3,40 +3,33 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
-	"os"
+	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
+	log "github.com/sirupsen/logrus"
 )
 
-// returns dynamodb clients for source/dest tables
-// if SOURCE_ACCOUNT, DESTINATION_ACCOUNT, CROSS_ACCOUNT_ROLE env vars are provided
-// clients will point to different accounts. Otherwise default credentials are used
-// not sure how to write a unit test for this
-func generateClients(region string) (*dynamodb.DynamoDB, *dynamodb.DynamoDB) {
-	srcAcct, srcAcctPresent := os.LookupEnv("SOURCE_ACCOUNT")
-	destAcct, destAcctPresent := os.LookupEnv("DESTINATION_ACCOUNT")
-	role, rolePresent := os.LookupEnv("CROSS_ACCOUNT_ROLE")
+// generateClient returns dynamodb client using whatever credentials are currently
+// configured.
+func generateClient(region string) *dynamodb.DynamoDB {
+	var client *dynamodb.DynamoDB
+	// log.Printf("Using default credentials")
+	client = dynamodb.New(session.New(&aws.Config{Region: &region}))
+	return client
+}
 
-	var srcClient *dynamodb.DynamoDB
-	var destClient *dynamodb.DynamoDB
-
-	if rolePresent && destAcctPresent && srcAcctPresent {
-		log.Printf("Assuming cross account role %s", role)
-		srcRole := fmt.Sprintf("arn:aws:iam::%s:role/%s", srcAcct, role)
-		destRole := fmt.Sprintf("arn:aws:iam::%s:role/%s", destAcct, role)
-		sess := session.Must(session.NewSession(&aws.Config{Region: &region}))
-		srcClient = dynamodb.New(sess, &aws.Config{Credentials: stscreds.NewCredentials(sess, srcRole)})
-		destClient = dynamodb.New(sess, &aws.Config{Credentials: stscreds.NewCredentials(sess, destRole)})
-	} else {
-		log.Printf("Using default credentials")
-		srcClient = dynamodb.New(session.New(&aws.Config{Region: &region}))
-		destClient = dynamodb.New(session.New(&aws.Config{Region: &region}))
-	}
-	return srcClient, destClient
+// generateClientRole returns dynamodb client by assuming the role in the given account
+func generateClientRole(region string, account string, role string) *dynamodb.DynamoDB {
+	roleArn := fmt.Sprintf("arn:aws:iam::%s:role/%s", account, role)
+	sess := session.Must(session.NewSession(&aws.Config{Region: &region}))
+	client := dynamodb.New(sess, &aws.Config{Credentials: stscreds.NewCredentials(sess, roleArn)})
+	return client
 }
 
 // generateBatchWriteInput outputs the input for an aws BatchWriteItem command
@@ -74,7 +67,83 @@ func makeBatches(itemChan chan []map[string]*dynamodb.AttributeValue, itemList [
 func cleanUpThreads(source string, count int, channel chan byte) {
 	log.Printf("Cleaning up %d threads for %s", count, source)
 	for i := 0; i < count; i++ {
-		log.Printf("Cleaned up thread %d of %d for %s", i+1, count, source)
+		log.Infoln(fmt.Sprintf("Cleaned up thread %d of %d for %s", i+1, count, source))
 		<-channel
 	}
+}
+
+func isProvisionedThroughputException(dynamoErr error) bool {
+	if aerr, ok := dynamoErr.(awserr.Error); ok {
+		return aerr.Code() == dynamodb.ErrCodeProvisionedThroughputExceededException
+	}
+	return false
+}
+
+// handleScanProvisionedThroughput retries Scan calls on provisionedThroughput until successful
+func handleScanProvisionedThroughput(client dynamodbiface.DynamoDBAPI, scanInput *dynamodb.ScanInput) (*dynamodb.ScanOutput, error) {
+	res, err := client.Scan(scanInput)
+
+	if err != nil && isProvisionedThroughputException(err) {
+		for isProvisionedThroughputException(err) {
+			log.Infoln("ProvisionedThroughputExceeded exception for Scan. Retrying in 5 secs")
+			time.Sleep(5 * time.Second)
+			res, err = client.Scan(scanInput)
+		}
+	}
+	return res, err
+}
+
+// handleWriteProvisionedThroughput retries BatchWrite calls that return ProvisionedThroughputExceeded exceptions until successful
+func handleWriteProvisionedThroughput(client dynamodbiface.DynamoDBAPI, writeInput *dynamodb.BatchWriteItemInput) (*dynamodb.BatchWriteItemOutput, error) {
+	res, err := client.BatchWriteItem(writeInput)
+
+	if err != nil && isProvisionedThroughputException(err) {
+		for isProvisionedThroughputException(err) {
+			log.Infoln("ProvisionedThroughputExceeded exception for Write. Retrying in 5 secs")
+			time.Sleep(5 * time.Second)
+			res, err = client.BatchWriteItem(writeInput)
+		}
+	}
+	return res, err
+}
+
+func handlePutItemProvisionedThroughput(client dynamodbiface.DynamoDBAPI, putItemInput *dynamodb.PutItemInput) (*dynamodb.PutItemOutput, error) {
+	res, err := client.PutItem(putItemInput)
+
+	if err != nil && isProvisionedThroughputException(err) {
+		for isProvisionedThroughputException(err) {
+			log.Infoln("ProvisionedThroughputExceeded exception for PutItem. Retrying in 5 secs")
+			time.Sleep(5 * time.Second)
+			res, err = client.PutItem(putItemInput)
+		}
+	}
+	return res, err
+}
+
+// ItemCount a struct for passing Item Counts between different threads
+type ItemCount struct {
+	Lock  sync.Mutex // <-- this mutex protects
+	Count int        // <-- this integer underneath
+}
+
+// NewItemCount generates an ItemCount struct at count 0
+func NewItemCount() *ItemCount {
+	return &ItemCount{
+		Lock:  sync.Mutex{},
+		Count: 0,
+	}
+}
+
+// Set sets ItemCount.Count to provided val
+func (i *ItemCount) Set(val int) {
+	i.Lock.Lock()
+	i.Count = val
+	i.Lock.Unlock()
+}
+
+// Add adds val to ItemCount.Count
+func (i *ItemCount) Add(val int) {
+	i.Lock.Lock()
+	i.Count = i.Count + val
+	i.Lock.Unlock()
 }

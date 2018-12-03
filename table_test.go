@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 )
@@ -16,13 +17,16 @@ type mockDynamo struct {
 	// to not have dupes we will have a map of event-id -> map of items
 	items              map[string]map[string]*dynamodb.AttributeValue
 	itemsMutex         sync.RWMutex
-	updateTableResp    []*dynamodb.UpdateTableOutput
-	updateTableErr     error
-	scanTableResp      []*dynamodb.ScanOutput
+	scanTableResp      []*ScanTableResp
 	describeTableResp  []*dynamodb.DescribeTableOutput
 	putItemResp        []*dynamodb.PutItemOutput
 	batchWriteItemResp []*dynamodb.BatchWriteItemOutput
 	err                []error
+}
+
+type ScanTableResp struct {
+	Err     error
+	ScanRes *dynamodb.ScanOutput
 }
 
 func (m *mockDynamo) getErr() error {
@@ -34,14 +38,6 @@ func (m *mockDynamo) getErr() error {
 		}
 	}
 	return resp
-}
-
-func (m *mockDynamo) UpdateTable(*dynamodb.UpdateTableInput) (*dynamodb.UpdateTableOutput, error) {
-	resp := m.updateTableResp[0]
-	if len(m.updateTableResp) > 1 {
-		m.updateTableResp = m.updateTableResp[1:]
-	}
-	return resp, m.updateTableErr
 }
 
 func (m *mockDynamo) DescribeTable(*dynamodb.DescribeTableInput) (*dynamodb.DescribeTableOutput, error) {
@@ -72,7 +68,7 @@ func (m *mockDynamo) Scan(input *dynamodb.ScanInput) (*dynamodb.ScanOutput, erro
 	if len(m.scanTableResp) > 1 {
 		m.scanTableResp = m.scanTableResp[1:]
 	}
-	return resp, m.getErr()
+	return resp.ScanRes, resp.Err
 }
 
 func (m *mockDynamo) BatchWriteItem(input *dynamodb.BatchWriteItemInput) (*dynamodb.BatchWriteItemOutput, error) {
@@ -104,6 +100,16 @@ func (m *mockDynamo) BatchWriteItem(input *dynamodb.BatchWriteItemInput) (*dynam
 	return resp, m.getErr()
 }
 
+func TestIsProvisionedThroughputException(t *testing.T) {
+	provThroughput := awserr.New(dynamodb.ErrCodeProvisionedThroughputExceededException, "foo", errors.New("bar"))
+	if !isProvisionedThroughputException(provThroughput) {
+		t.Fatalf("isProvisionedThroughputException should return true for an awserr with code ErrCodeProvisionedThroughputExceededException")
+	}
+	if isProvisionedThroughputException(errors.New("foobar")) {
+		t.Fatalf("isProvisionedThroughputException should return false if the error is not an awserr")
+	}
+}
+
 func TestNewTable(t *testing.T) {
 	tab := NewTable(&mockDynamo{}, "testTable")
 	if tab.Name != "testTable" {
@@ -111,154 +117,38 @@ func TestNewTable(t *testing.T) {
 	}
 }
 
-// should do nothing
-func TestUpdateTableNoChange(t *testing.T) {
-	tab := NewTable(&mockDynamo{
-		updateTableResp: make([]*dynamodb.UpdateTableOutput, 1),
-		updateTableErr:  errors.New("blah blah blah will not change"),
-	}, "face")
-	tab.UpdateTable(nil)
-}
-
-func TestUpdateTableFull(t *testing.T) {
-	tab := NewTable(&mockDynamo{
-		updateTableErr:  errors.New("blah blah blah is being updated"),
-		updateTableResp: make([]*dynamodb.UpdateTableOutput, 1),
-		describeTableResp: []*dynamodb.DescribeTableOutput{
-			{
-				Table: &dynamodb.TableDescription{
-					TableStatus: aws.String("UPDATING"),
-					GlobalSecondaryIndexes: []*dynamodb.GlobalSecondaryIndexDescription{
-						{
-							IndexStatus: aws.String("UPDATING"),
-						},
-					},
-				},
-			},
-			{
-				Table: &dynamodb.TableDescription{
-					TableStatus: aws.String("ACTIVE"),
-					GlobalSecondaryIndexes: []*dynamodb.GlobalSecondaryIndexDescription{
-						{
-							IndexStatus: aws.String("UPDATING"),
-						},
-					},
-				},
-			},
-			{
-				Table: &dynamodb.TableDescription{
-					TableStatus: aws.String("ACTIVE"),
-					GlobalSecondaryIndexes: []*dynamodb.GlobalSecondaryIndexDescription{
-						{
-							IndexStatus: aws.String("ACTIVE"),
-						},
-					},
-				},
-			},
-		},
-		err: nil,
-	}, "face")
-	tab.UpdateTable(nil)
-}
-
-func TestUpdateTablePanic(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic")
-		}
-	}()
-	tab := NewTable(
-		&mockDynamo{
-			updateTableErr:  errors.New("some unknown error"),
-			updateTableResp: make([]*dynamodb.UpdateTableOutput, 1),
-		}, "face")
-	tab.UpdateTable(nil)
-}
-
-func TestDescribeTablePanic(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic")
-		}
-	}()
-	tab := NewTable(
-		&mockDynamo{
-			err:             []error{errors.New("some unknown error")},
-			updateTableResp: make([]*dynamodb.UpdateTableOutput, 1),
-			describeTableResp: []*dynamodb.DescribeTableOutput{
-				{
-					Table: &dynamodb.TableDescription{
-						TableStatus: aws.String("UPDATING"),
-					},
-				},
-			},
-		}, "face")
-	tab.UpdateTable(nil)
-}
-
-func TestIncreaseCapacity(t *testing.T) {
-	tab := NewTable(&mockDynamo{
-		updateTableErr:  errors.New("blah blah blah is being updated"),
-		updateTableResp: make([]*dynamodb.UpdateTableOutput, 1),
-		describeTableResp: []*dynamodb.DescribeTableOutput{
-			{
-				Table: &dynamodb.TableDescription{
-					ProvisionedThroughput: &dynamodb.ProvisionedThroughputDescription{
-						ReadCapacityUnits:  aws.Int64(50),
-						WriteCapacityUnits: aws.Int64(50),
-					},
-					TableStatus: aws.String("ACTIVE"),
-					GlobalSecondaryIndexes: []*dynamodb.GlobalSecondaryIndexDescription{
-						{
-							IndexStatus: aws.String("ACTIVE"),
-							ProvisionedThroughput: &dynamodb.ProvisionedThroughputDescription{
-								ReadCapacityUnits:  aws.Int64(50),
-								WriteCapacityUnits: aws.Int64(50),
-							},
-						},
-					},
-				},
-			},
-		}}, "face")
-	tab.IncreaseCapacity("write")
-	tab.IncreaseCapacity("read")
-}
-
-func TestIncreaseCapacityPanic(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic")
-		}
-	}()
-	tab := NewTable(&mockDynamo{
-		err:               []error{errors.New("some dang error")},
-		describeTableResp: make([]*dynamodb.DescribeTableOutput, 1),
-	}, "face")
-	tab.IncreaseCapacity("write")
-}
-
 func TestScan(t *testing.T) {
 	lockChan := make(chan byte, 1)
 	tab := NewTable(&mockDynamo{
-		scanTableResp: []*dynamodb.ScanOutput{
+		scanTableResp: []*ScanTableResp{
 			{
-				LastEvaluatedKey: map[string]*dynamodb.AttributeValue{
-					"something": &dynamodb.AttributeValue{},
+				ScanRes: &dynamodb.ScanOutput{
+					LastEvaluatedKey: map[string]*dynamodb.AttributeValue{
+						"something": &dynamodb.AttributeValue{},
+					},
+					Items: make([]map[string]*dynamodb.AttributeValue, 100),
 				},
-				Items: make([]map[string]*dynamodb.AttributeValue, 100),
+				Err: nil,
 			},
 			{
-				LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
-				Items:            make([]map[string]*dynamodb.AttributeValue, 10),
+				ScanRes: nil,
+				Err:     awserr.New(dynamodb.ErrCodeProvisionedThroughputExceededException, "foo", errors.New("bar")),
+			},
+			{
+				ScanRes: &dynamodb.ScanOutput{
+					LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
+					Items:            make([]map[string]*dynamodb.AttributeValue, 10),
+				},
+				Err: nil,
 			},
 		},
 	}, "face")
 	// have to make buffered chan or write will block
 	tab.ItemChan = make(chan []map[string]*dynamodb.AttributeValue, 10)
-	tab.ScanTable(1, 1, lockChan)
+	tab.ScanTable(1, 1, lockChan, true)
 	<-lockChan
 	close(tab.ItemChan)
-	if tab.ItemCount != 110 {
+	if tab.ItemCount.Count != 110 {
 		t.Errorf("Item count should be 20 after scan table call")
 	}
 	if len(tab.ItemChan) != 8 {
@@ -281,23 +171,26 @@ func TestScanPanic(t *testing.T) {
 		}
 	}()
 	tab := NewTable(&mockDynamo{
-		err: []error{errors.New("some dang error")},
-		scanTableResp: []*dynamodb.ScanOutput{
+		scanTableResp: []*ScanTableResp{
 			{
-				LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
+				ScanRes: nil,
+				Err:     errors.New("some dang error"),
 			},
 		},
 	}, "face")
 	lockChan := make(chan byte, 1)
-	tab.ScanTable(1, 1, lockChan)
+	tab.ScanTable(1, 1, lockChan, true)
 }
 
 func TestPullItems(t *testing.T) {
 	tab := NewTable(&mockDynamo{
-		scanTableResp: []*dynamodb.ScanOutput{
+		scanTableResp: []*ScanTableResp{
 			{
-				LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
-				Items:            make([]map[string]*dynamodb.AttributeValue, 100),
+				ScanRes: &dynamodb.ScanOutput{
+					LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
+					Items:            make([]map[string]*dynamodb.AttributeValue, 100),
+				},
+				Err: nil,
 			},
 		},
 	}, "face")
@@ -306,8 +199,29 @@ func TestPullItems(t *testing.T) {
 	lockChan := make(chan byte, 1)
 	tab.PullItems(lockChan)
 	<-lockChan
-	if tab.ItemCount != 500 {
+	if tab.ItemCount.Count != 500 {
 		t.Errorf("item count should be 500. Is: %d", tab.ItemCount)
+	}
+}
+
+func TestCountItems(t *testing.T) {
+	lockChan := make(chan byte, 1)
+	tab := NewTable(&mockDynamo{
+		scanTableResp: []*ScanTableResp{
+			{
+				ScanRes: &dynamodb.ScanOutput{
+					LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
+					Items:            make([]map[string]*dynamodb.AttributeValue, 100),
+				},
+				Err: nil,
+			},
+		},
+	}, "face")
+	tab.CountItems(lockChan)
+	<-lockChan
+	close(tab.ItemChan)
+	if tab.ItemCount.Count != 500 {
+		t.Errorf("Item count should be 20 after scan table call")
 	}
 }
 
@@ -410,15 +324,12 @@ func TestBatchWriteItems(t *testing.T) {
 	}, "face")
 	itemChan := make(chan []map[string]*dynamodb.AttributeValue, 10)
 	makeBatches(itemChan, itemList)
-	threadChan := make(chan bool, 1)
+	close(itemChan)
+	itemCount := NewItemCount()
 	lockChan := make(chan byte, 1)
 	unprocessedItemsChan := make(chan map[string]*dynamodb.AttributeValue, 100)
-	for len(itemChan) > 0 {
-		list := <-itemChan
-		tab.BatchWriteItems(list, threadChan, lockChan, unprocessedItemsChan)
-		<-lockChan
-		<-threadChan
-	}
+	tab.BatchWriteItems(itemChan, lockChan, itemCount, "1/1", unprocessedItemsChan)
+	<-lockChan
 	if len(unprocessedItemsChan) > 2 {
 		t.Log("Unprocessed items:")
 		for len(unprocessedItemsChan) > 2 {
@@ -435,7 +346,6 @@ func TestBatchWritePanic1(t *testing.T) {
 			t.Errorf("The code did not panic")
 		}
 	}()
-	threadChan := make(chan bool, 1)
 	lockChan := make(chan byte, 1)
 	unprocessedItemsChan := make(chan map[string]*dynamodb.AttributeValue, 100)
 	items := []map[string]*dynamodb.AttributeValue{
@@ -443,6 +353,8 @@ func TestBatchWritePanic1(t *testing.T) {
 			"event-id": &dynamodb.AttributeValue{S: aws.String("some dang thing")},
 		},
 	}
+	itemChan := make(chan []map[string]*dynamodb.AttributeValue, 10)
+	makeBatches(itemChan, items)
 	tab := NewTable(&mockDynamo{
 		err: []error{errors.New("some dang error")},
 		batchWriteItemResp: []*dynamodb.BatchWriteItemOutput{
@@ -451,8 +363,8 @@ func TestBatchWritePanic1(t *testing.T) {
 			},
 		},
 	}, "face")
-
-	tab.BatchWriteItems(items, threadChan, lockChan, unprocessedItemsChan)
+	itemCount := NewItemCount()
+	tab.BatchWriteItems(itemChan, lockChan, itemCount, "1/1", unprocessedItemsChan)
 }
 
 func TestBatchWritePanic2(t *testing.T) {
@@ -461,7 +373,6 @@ func TestBatchWritePanic2(t *testing.T) {
 			t.Errorf("The code did not panic")
 		}
 	}()
-	threadChan := make(chan bool, 1)
 	lockChan := make(chan byte, 1)
 	unprocessedItemsChan := make(chan map[string]*dynamodb.AttributeValue, 100)
 	items := []map[string]*dynamodb.AttributeValue{
@@ -469,6 +380,8 @@ func TestBatchWritePanic2(t *testing.T) {
 			"event-id": &dynamodb.AttributeValue{S: aws.String("some dang thing")},
 		},
 	}
+	itemChan := make(chan []map[string]*dynamodb.AttributeValue, 10)
+	makeBatches(itemChan, items)
 	tab := NewTable(&mockDynamo{
 		err: []error{nil, errors.New("some dang error")},
 		batchWriteItemResp: []*dynamodb.BatchWriteItemOutput{
@@ -488,7 +401,8 @@ func TestBatchWritePanic2(t *testing.T) {
 		},
 	}, "face")
 
-	tab.BatchWriteItems(items, threadChan, lockChan, unprocessedItemsChan)
+	itemCount := NewItemCount()
+	tab.BatchWriteItems(itemChan, lockChan, itemCount, "1/1", unprocessedItemsChan)
 }
 
 func TestPushItems(t *testing.T) {
