@@ -37,17 +37,32 @@ func (t *Table) PullItems(waitChan chan byte) {
 	shards := 5
 
 	for i := 0; i < shards; i++ {
-		go t.ScanTable(i, shards, lockChan)
+		go t.ScanTable(i, shards, lockChan, true)
 	}
 	cleanUpThreads("PullItems", shards, lockChan)
 	close(t.ItemChan)
-	log.Println("Item channel closed")
+	log.Infoln(fmt.Sprintf("Finished pulling items from Source Table %s", t.Name))
+	waitChan <- 1
+}
+
+// CountItems scans the entire table and updates t.ItemCount
+func (t *Table) CountItems(waitChan chan byte) {
+	t.ItemCount.Set(0)
+	lockChan := make(chan byte)
+	// dynamodb scanners
+	shards := 5
+
+	for i := 0; i < shards; i++ {
+		go t.ScanTable(i, shards, lockChan, false)
+	}
+	cleanUpThreads("PullItems", shards, lockChan)
+	log.Infoln(fmt.Sprintf("Finished pulling items from Source Table %s", t.Name))
 	waitChan <- 1
 }
 
 // ScanTable is executes a parallel scan on the dynamo database
-// all items are appended to a channel.
-func (t *Table) ScanTable(shard int, totalShards int, lockChan chan byte) {
+// all items are appended to a channel if collectItems == true
+func (t *Table) ScanTable(shard int, totalShards int, lockChan chan byte, collectItems bool) {
 	counter := 1
 
 	res, err := handleScanProvisionedThroughput(t.Client, &dynamodb.ScanInput{
@@ -62,7 +77,10 @@ func (t *Table) ScanTable(shard int, totalShards int, lockChan chan byte) {
 		log.Infoln(fmt.Sprintf("Shard %d pulled page %d from %s", shard, counter, t.Name))
 		counter++
 		t.ItemCount.Add(len(res.Items))
-		makeBatches(t.ItemChan, res.Items)
+		// don't write to unbuffered channel if only counting
+		if collectItems {
+			makeBatches(t.ItemChan, res.Items)
+		}
 
 		res, err = handleScanProvisionedThroughput(t.Client, &dynamodb.ScanInput{
 			ConsistentRead:    aws.Bool(true),
@@ -78,7 +96,11 @@ func (t *Table) ScanTable(shard int, totalShards int, lockChan chan byte) {
 	}
 
 	t.ItemCount.Add(len(res.Items))
-	makeBatches(t.ItemChan, res.Items)
+
+	// don't write to unbuffered channel if only counting
+	if collectItems {
+		makeBatches(t.ItemChan, res.Items)
+	}
 
 	log.Infoln(fmt.Sprintf("Shard %d finished pulling items from %s", shard, t.Name))
 	lockChan <- 1
@@ -108,7 +130,7 @@ func (t *Table) PushItems(itemChan chan []map[string]*dynamodb.AttributeValue, w
 	for i := range unprocessedItems {
 		counter++
 		log.Infoln(fmt.Sprintf("Storing unprocessed item %d", counter))
-		_, err := t.Client.PutItem(&dynamodb.PutItemInput{
+		_, err := handlePutItemProvisionedThroughput(t.Client, &dynamodb.PutItemInput{
 			TableName: &t.Name,
 			Item:      i,
 		})
@@ -116,6 +138,7 @@ func (t *Table) PushItems(itemChan chan []map[string]*dynamodb.AttributeValue, w
 			log.Errorln(fmt.Sprintf("%+v", err))
 		}
 	}
+	log.Infoln(fmt.Sprintf("Finished writing items to %s", t.Name))
 	waitChan <- 1
 }
 
@@ -129,7 +152,7 @@ func (t *Table) BatchWriteItems(itemChan chan []map[string]*dynamodb.AttributeVa
 		beginningRange := itemCount.Count - len(itemList)
 		endRange := itemCount.Count
 		itemCount.Lock.Unlock()
-		log.Infof(fmt.Sprintf("Thread %s Dispatched items %d-%d for processing", threadID, beginningRange, endRange))
+		log.Infoln(fmt.Sprintf("Thread %s Dispatched items %d-%d for processing", threadID, beginningRange, endRange))
 
 		// do write
 		input, _ := generateBatchWriteInput(t.Name, itemList)

@@ -107,6 +107,19 @@ func handleWriteProvisionedThroughput(client dynamodbiface.DynamoDBAPI, writeInp
 	return res, err
 }
 
+func handlePutItemProvisionedThroughput(client dynamodbiface.DynamoDBAPI, putItemInput *dynamodb.PutItemInput) (*dynamodb.PutItemOutput, error) {
+	res, err := client.PutItem(putItemInput)
+
+	if err != nil && isProvisionedThroughputException(err) {
+		for isProvisionedThroughputException(err) {
+			log.Infoln("ProvisionedThroughputExceeded exception for PutItem. Retrying in 5 secs")
+			time.Sleep(5 * time.Second)
+			res, err = client.PutItem(putItemInput)
+		}
+	}
+	return res, err
+}
+
 // ItemCount a struct for passing Item Counts between different threads
 type ItemCount struct {
 	Lock  sync.Mutex // <-- this mutex protects

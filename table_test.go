@@ -145,7 +145,7 @@ func TestScan(t *testing.T) {
 	}, "face")
 	// have to make buffered chan or write will block
 	tab.ItemChan = make(chan []map[string]*dynamodb.AttributeValue, 10)
-	tab.ScanTable(1, 1, lockChan)
+	tab.ScanTable(1, 1, lockChan, true)
 	<-lockChan
 	close(tab.ItemChan)
 	if tab.ItemCount.Count != 110 {
@@ -179,7 +179,7 @@ func TestScanPanic(t *testing.T) {
 		},
 	}, "face")
 	lockChan := make(chan byte, 1)
-	tab.ScanTable(1, 1, lockChan)
+	tab.ScanTable(1, 1, lockChan, true)
 }
 
 func TestPullItems(t *testing.T) {
@@ -201,6 +201,27 @@ func TestPullItems(t *testing.T) {
 	<-lockChan
 	if tab.ItemCount.Count != 500 {
 		t.Errorf("item count should be 500. Is: %d", tab.ItemCount)
+	}
+}
+
+func TestCountItems(t *testing.T) {
+	lockChan := make(chan byte, 1)
+	tab := NewTable(&mockDynamo{
+		scanTableResp: []*ScanTableResp{
+			{
+				ScanRes: &dynamodb.ScanOutput{
+					LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
+					Items:            make([]map[string]*dynamodb.AttributeValue, 100),
+				},
+				Err: nil,
+			},
+		},
+	}, "face")
+	tab.CountItems(lockChan)
+	<-lockChan
+	close(tab.ItemChan)
+	if tab.ItemCount.Count != 500 {
+		t.Errorf("Item count should be 20 after scan table call")
 	}
 }
 
