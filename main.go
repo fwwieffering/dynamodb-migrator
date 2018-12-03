@@ -57,7 +57,7 @@ func defaultFlags() []cli.Flag {
 			Name:   "log-level",
 			Value:  "error",
 			Usage:  "Log level (panic, fatal, error, warn, info, or debug)",
-			EnvVar: "PLUGIN_LOG_LEVEL,LOG_LEVEL",
+			EnvVar: "LOG_LEVEL",
 		},
 	}
 }
