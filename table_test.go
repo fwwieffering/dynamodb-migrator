@@ -16,8 +16,6 @@ type mockDynamo struct {
 	// to not have dupes we will have a map of event-id -> map of items
 	items              map[string]map[string]*dynamodb.AttributeValue
 	itemsMutex         sync.RWMutex
-	updateTableResp    []*dynamodb.UpdateTableOutput
-	updateTableErr     error
 	scanTableResp      []*dynamodb.ScanOutput
 	describeTableResp  []*dynamodb.DescribeTableOutput
 	putItemResp        []*dynamodb.PutItemOutput
@@ -34,14 +32,6 @@ func (m *mockDynamo) getErr() error {
 		}
 	}
 	return resp
-}
-
-func (m *mockDynamo) UpdateTable(*dynamodb.UpdateTableInput) (*dynamodb.UpdateTableOutput, error) {
-	resp := m.updateTableResp[0]
-	if len(m.updateTableResp) > 1 {
-		m.updateTableResp = m.updateTableResp[1:]
-	}
-	return resp, m.updateTableErr
 }
 
 func (m *mockDynamo) DescribeTable(*dynamodb.DescribeTableInput) (*dynamodb.DescribeTableOutput, error) {
@@ -109,132 +99,6 @@ func TestNewTable(t *testing.T) {
 	if tab.Name != "testTable" {
 		t.Fatal("Name is not set correctly")
 	}
-}
-
-// should do nothing
-func TestUpdateTableNoChange(t *testing.T) {
-	tab := NewTable(&mockDynamo{
-		updateTableResp: make([]*dynamodb.UpdateTableOutput, 1),
-		updateTableErr:  errors.New("blah blah blah will not change"),
-	}, "face")
-	tab.UpdateTable(nil)
-}
-
-func TestUpdateTableFull(t *testing.T) {
-	tab := NewTable(&mockDynamo{
-		updateTableErr:  errors.New("blah blah blah is being updated"),
-		updateTableResp: make([]*dynamodb.UpdateTableOutput, 1),
-		describeTableResp: []*dynamodb.DescribeTableOutput{
-			{
-				Table: &dynamodb.TableDescription{
-					TableStatus: aws.String("UPDATING"),
-					GlobalSecondaryIndexes: []*dynamodb.GlobalSecondaryIndexDescription{
-						{
-							IndexStatus: aws.String("UPDATING"),
-						},
-					},
-				},
-			},
-			{
-				Table: &dynamodb.TableDescription{
-					TableStatus: aws.String("ACTIVE"),
-					GlobalSecondaryIndexes: []*dynamodb.GlobalSecondaryIndexDescription{
-						{
-							IndexStatus: aws.String("UPDATING"),
-						},
-					},
-				},
-			},
-			{
-				Table: &dynamodb.TableDescription{
-					TableStatus: aws.String("ACTIVE"),
-					GlobalSecondaryIndexes: []*dynamodb.GlobalSecondaryIndexDescription{
-						{
-							IndexStatus: aws.String("ACTIVE"),
-						},
-					},
-				},
-			},
-		},
-		err: nil,
-	}, "face")
-	tab.UpdateTable(nil)
-}
-
-func TestUpdateTablePanic(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic")
-		}
-	}()
-	tab := NewTable(
-		&mockDynamo{
-			updateTableErr:  errors.New("some unknown error"),
-			updateTableResp: make([]*dynamodb.UpdateTableOutput, 1),
-		}, "face")
-	tab.UpdateTable(nil)
-}
-
-func TestDescribeTablePanic(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic")
-		}
-	}()
-	tab := NewTable(
-		&mockDynamo{
-			err:             []error{errors.New("some unknown error")},
-			updateTableResp: make([]*dynamodb.UpdateTableOutput, 1),
-			describeTableResp: []*dynamodb.DescribeTableOutput{
-				{
-					Table: &dynamodb.TableDescription{
-						TableStatus: aws.String("UPDATING"),
-					},
-				},
-			},
-		}, "face")
-	tab.UpdateTable(nil)
-}
-
-func TestIncreaseCapacity(t *testing.T) {
-	tab := NewTable(&mockDynamo{
-		updateTableErr:  errors.New("blah blah blah is being updated"),
-		updateTableResp: make([]*dynamodb.UpdateTableOutput, 1),
-		describeTableResp: []*dynamodb.DescribeTableOutput{
-			{
-				Table: &dynamodb.TableDescription{
-					ProvisionedThroughput: &dynamodb.ProvisionedThroughputDescription{
-						ReadCapacityUnits:  aws.Int64(50),
-						WriteCapacityUnits: aws.Int64(50),
-					},
-					TableStatus: aws.String("ACTIVE"),
-					GlobalSecondaryIndexes: []*dynamodb.GlobalSecondaryIndexDescription{
-						{
-							IndexStatus: aws.String("ACTIVE"),
-							ProvisionedThroughput: &dynamodb.ProvisionedThroughputDescription{
-								ReadCapacityUnits:  aws.Int64(50),
-								WriteCapacityUnits: aws.Int64(50),
-							},
-						},
-					},
-				},
-			},
-		}}, "face")
-	tab.IncreaseCapacity("write")
-	tab.IncreaseCapacity("read")
-}
-
-func TestIncreaseCapacityPanic(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Errorf("The code did not panic")
-		}
-	}()
-	tab := NewTable(&mockDynamo{
-		err:               []error{errors.New("some dang error")},
-		describeTableResp: make([]*dynamodb.DescribeTableOutput, 1),
-	}, "face")
-	tab.IncreaseCapacity("write")
 }
 
 func TestScan(t *testing.T) {

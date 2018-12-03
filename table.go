@@ -2,7 +2,6 @@ package main
 
 import (
 	"log"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -26,125 +25,6 @@ func NewTable(client dynamodbiface.DynamoDBAPI, name string) *Table {
 		ItemCount: 0,
 		ItemChan:  make(chan []map[string]*dynamodb.AttributeValue),
 	}
-}
-
-// UpdateTable submits the update to table capacity to dynamodb, and waits until\\
-// the table update is complete
-func (t *Table) UpdateTable(input *dynamodb.UpdateTableInput) {
-	_, err := t.Client.UpdateTable(input)
-	if err != nil {
-		if strings.Contains(err.Error(), "will not change") {
-			log.Printf("No updates to be made")
-			return
-		} else if strings.Contains(err.Error(), "is being updated") {
-			log.Printf("Update already in progress")
-		} else {
-			panic(err)
-		}
-	}
-
-	// parses describetable output
-	getStatus := func(output *dynamodb.DescribeTableOutput) bool {
-		active := true
-		if *output.Table.TableStatus != "ACTIVE" {
-			active = false
-			return active
-		}
-		for i := range output.Table.GlobalSecondaryIndexes {
-			if *output.Table.GlobalSecondaryIndexes[i].IndexStatus != "ACTIVE" {
-				active = false
-				return active
-			}
-		}
-		return active
-	}
-
-	// wait for table update to complete
-	updateRes, err := t.Client.DescribeTable(&dynamodb.DescribeTableInput{
-		TableName: &t.Name,
-	})
-
-	for !getStatus(updateRes) {
-		if err != nil {
-			panic(err)
-		}
-		log.Printf("Waiting for table update to complete....")
-		updateRes, err = t.Client.DescribeTable(&dynamodb.DescribeTableInput{
-			TableName: &t.Name,
-		})
-		time.Sleep(5 * time.Second)
-	}
-	log.Printf("Table update complete. Table in status %s", *updateRes.Table.TableStatus)
-}
-
-// IncreaseCapacity increases the read/write capacity of a table and all GlobalSecondaryIndexes
-// 3000 read/writes is probably too many for most cases but should give runway for large tables
-func (t *Table) IncreaseCapacity(readOrWrite string) *dynamodb.UpdateTableInput {
-	// Get table throughput information
-	res, err := t.Client.DescribeTable(&dynamodb.DescribeTableInput{
-		TableName: &t.Name,
-	})
-	if err != nil {
-		panic(err)
-	}
-	var readCapacity *int64
-	var writeCapacity *int64
-
-	if readOrWrite == "write" {
-		readCapacity = res.Table.ProvisionedThroughput.ReadCapacityUnits
-		writeCapacity = aws.Int64(3000)
-	} else {
-		readCapacity = aws.Int64(3000)
-		writeCapacity = res.Table.ProvisionedThroughput.WriteCapacityUnits
-	}
-	originalSettings := dynamodb.UpdateTableInput{
-		TableName: &t.Name,
-		ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
-			ReadCapacityUnits:  res.Table.ProvisionedThroughput.ReadCapacityUnits,
-			WriteCapacityUnits: res.Table.ProvisionedThroughput.WriteCapacityUnits,
-		},
-	}
-	newSettings := dynamodb.UpdateTableInput{
-		TableName: &t.Name,
-		ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
-			WriteCapacityUnits: writeCapacity,
-			ReadCapacityUnits:  readCapacity,
-		},
-	}
-	// Collect global secondary indexes and increase capacity as well
-	for i := range res.Table.GlobalSecondaryIndexes {
-		if readOrWrite == "write" {
-			readCapacity = res.Table.ProvisionedThroughput.ReadCapacityUnits
-			writeCapacity = aws.Int64(3000)
-		} else {
-			readCapacity = aws.Int64(3000)
-			writeCapacity = res.Table.ProvisionedThroughput.WriteCapacityUnits
-		}
-		if res.Table.GlobalSecondaryIndexes[i].ProvisionedThroughput.WriteCapacityUnits != writeCapacity || res.Table.GlobalSecondaryIndexes[i].ProvisionedThroughput.ReadCapacityUnits != readCapacity {
-			newSettings.GlobalSecondaryIndexUpdates = append(newSettings.GlobalSecondaryIndexUpdates, &dynamodb.GlobalSecondaryIndexUpdate{
-				Update: &dynamodb.UpdateGlobalSecondaryIndexAction{
-					IndexName: res.Table.GlobalSecondaryIndexes[i].IndexName,
-					ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
-						WriteCapacityUnits: writeCapacity,
-						ReadCapacityUnits:  readCapacity,
-					},
-				},
-			})
-			originalSettings.GlobalSecondaryIndexUpdates = append(newSettings.GlobalSecondaryIndexUpdates, &dynamodb.GlobalSecondaryIndexUpdate{
-				Update: &dynamodb.UpdateGlobalSecondaryIndexAction{
-					IndexName: res.Table.GlobalSecondaryIndexes[i].IndexName,
-					ProvisionedThroughput: &dynamodb.ProvisionedThroughput{
-						WriteCapacityUnits: res.Table.GlobalSecondaryIndexes[i].ProvisionedThroughput.WriteCapacityUnits,
-						ReadCapacityUnits:  res.Table.GlobalSecondaryIndexes[i].ProvisionedThroughput.ReadCapacityUnits,
-					},
-				},
-			})
-		}
-	}
-
-	t.UpdateTable(&newSettings)
-
-	return &originalSettings
 }
 
 // PullItems sends off async scans of dynamodb table and writes the items to a channel

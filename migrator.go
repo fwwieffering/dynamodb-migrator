@@ -40,11 +40,6 @@ func (m *Migrator) Run() error {
 	srcTable := NewTable(srcDdb, m.Config.SourceTable)
 	destTable := NewTable(destDdb, m.Config.DestTable)
 
-	log.Printf("Dynamodb migration from %s to %s", srcTable.Name, destTable.Name)
-	log.Printf("Increasing table %s write capacity to 3000 for table and all GSIs", destTable.Name)
-	destOrigSettings := destTable.IncreaseCapacity("write")
-	log.Printf("Increasing table %s read capacity to 3000 for table and all GSIs", srcTable.Name)
-	srcOrigSettings := srcTable.IncreaseCapacity("read")
 	log.Println("Pulling items from source table")
 	go srcTable.PullItems(waitChan)
 	go destTable.PushItems(srcTable.ItemChan, waitChan)
@@ -56,10 +51,6 @@ func (m *Migrator) Run() error {
 	log.Printf("Migration complete.")
 	log.Printf("Items in %s: %d", m.Config.SourceTable, srcTable.ItemCount)
 	log.Printf("Items in %s: %d", m.Config.DestTable, destTable.ItemCount)
-	log.Printf("Knocking table %s write capacity back down to original settings", destTable.Name)
-	destTable.UpdateTable(destOrigSettings)
-	log.Printf("Knocking table %s read capacity back down to original settings", srcTable.Name)
-	srcTable.UpdateTable(srcOrigSettings)
 
 	return nil
 }
