@@ -1,12 +1,13 @@
 package main
 
 import (
-	"log"
+	"fmt"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
+	log "github.com/sirupsen/logrus"
 )
 
 // Table provides the capability to read and write to tables
@@ -49,7 +50,7 @@ func (t *Table) PullItems(waitChan chan byte) {
 func (t *Table) ScanTable(shard int, totalShards int, lockChan chan byte) {
 	counter := 1
 
-	res, err := t.Client.Scan(&dynamodb.ScanInput{
+	res, err := handleScanProvisionedThroughput(t.Client, &dynamodb.ScanInput{
 		ConsistentRead: aws.Bool(true),
 		Select:         aws.String("ALL_ATTRIBUTES"),
 		TableName:      &t.Name,
@@ -63,7 +64,7 @@ func (t *Table) ScanTable(shard int, totalShards int, lockChan chan byte) {
 		t.ItemCount = t.ItemCount + len(res.Items)
 		makeBatches(t.ItemChan, res.Items)
 
-		res, err = t.Client.Scan(&dynamodb.ScanInput{
+		res, err = handleScanProvisionedThroughput(t.Client, &dynamodb.ScanInput{
 			ConsistentRead:    aws.Bool(true),
 			Select:            aws.String("ALL_ATTRIBUTES"),
 			TableName:         &t.Name,
@@ -72,13 +73,12 @@ func (t *Table) ScanTable(shard int, totalShards int, lockChan chan byte) {
 			TotalSegments:     aws.Int64(int64(totalShards)),
 		})
 	}
-
-	t.ItemCount = t.ItemCount + len(res.Items)
-	makeBatches(t.ItemChan, res.Items)
-
 	if err != nil {
 		panic(err)
 	}
+
+	t.ItemCount = t.ItemCount + len(res.Items)
+	makeBatches(t.ItemChan, res.Items)
 
 	log.Printf("Shard %d finished pulling items from %s", shard, t.Name)
 	lockChan <- 1
@@ -130,7 +130,7 @@ func (t *Table) PushItems(itemChan chan []map[string]*dynamodb.AttributeValue, w
 // Unprocessed items are retried 3 times and then appended to a channel to be processed later
 func (t *Table) BatchWriteItems(items []map[string]*dynamodb.AttributeValue, concurrentThreads chan bool, lockChan chan byte, unprocessedItems chan map[string]*dynamodb.AttributeValue) {
 	input, _ := generateBatchWriteInput(t.Name, items)
-	res, batchErr := t.Client.BatchWriteItem(input)
+	res, batchErr := handleWriteProvisionedThroughput(t.Client, input)
 	if batchErr != nil {
 		panic(batchErr)
 	}
@@ -139,8 +139,8 @@ func (t *Table) BatchWriteItems(items []map[string]*dynamodb.AttributeValue, con
 	unprocessed := res.UnprocessedItems
 	retries := 0
 	for len(unprocessed) > 0 && retries < 3 {
-		log.Printf("%d unprocessed items. Processing...", len(unprocessed))
-		res, err := t.Client.BatchWriteItem(&dynamodb.BatchWriteItemInput{
+		log.Infoln(fmt.Sprintf("%d unprocessed items. Processing...", len(unprocessed)))
+		res, err := handleWriteProvisionedThroughput(t.Client, &dynamodb.BatchWriteItemInput{
 			RequestItems: unprocessed,
 		})
 		unprocessed = res.UnprocessedItems
@@ -152,9 +152,9 @@ func (t *Table) BatchWriteItems(items []map[string]*dynamodb.AttributeValue, con
 		time.Sleep(1 * time.Second)
 	}
 	if retries == 3 && len(unprocessed) > 0 {
-		log.Printf("Unable to process %d items", len(unprocessed))
+		log.Errorln(fmt.Sprintf("Unable to process %d items. Writing them to the cleanup channel", len(unprocessed)))
 		for u := range unprocessed[t.Name] {
-			log.Printf("Length of unprocessed items channel: %d", len(unprocessedItems))
+			log.Infoln(fmt.Sprintf("Length of unprocessed items channel: %d", len(unprocessedItems)))
 			unprocessedItems <- unprocessed[t.Name][u].PutRequest.Item
 		}
 	}

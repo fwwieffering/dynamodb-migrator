@@ -3,12 +3,15 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
+	log "github.com/sirupsen/logrus"
 )
 
 // generateClient returns dynamodb client using whatever credentials are currently
@@ -63,7 +66,42 @@ func makeBatches(itemChan chan []map[string]*dynamodb.AttributeValue, itemList [
 func cleanUpThreads(source string, count int, channel chan byte) {
 	log.Printf("Cleaning up %d threads for %s", count, source)
 	for i := 0; i < count; i++ {
-		log.Printf("Cleaned up thread %d of %d for %s", i+1, count, source)
+		log.Infoln(fmt.Sprintf("Cleaned up thread %d of %d for %s", i+1, count, source))
 		<-channel
 	}
+}
+
+func isProvisionedThroughputException(dynamoErr error) bool {
+	if aerr, ok := dynamoErr.(awserr.Error); ok {
+		return aerr.Code() == dynamodb.ErrCodeProvisionedThroughputExceededException
+	}
+	return false
+}
+
+// handleScanProvisionedThroughput retries Scan calls on provisionedThroughput until successful
+func handleScanProvisionedThroughput(client dynamodbiface.DynamoDBAPI, scanInput *dynamodb.ScanInput) (*dynamodb.ScanOutput, error) {
+	res, err := client.Scan(scanInput)
+
+	if err != nil && isProvisionedThroughputException(err) {
+		for isProvisionedThroughputException(err) {
+			log.Infoln("ProvisionedThroughputExceeded exception for Scan. Retrying in 5 secs")
+			time.Sleep(5 * time.Second)
+			res, err = client.Scan(scanInput)
+		}
+	}
+	return res, err
+}
+
+// handleWriteProvisionedThroughput retries BatchWrite calls that return ProvisionedThroughputExceeded exceptions until successful
+func handleWriteProvisionedThroughput(client dynamodbiface.DynamoDBAPI, writeInput *dynamodb.BatchWriteItemInput) (*dynamodb.BatchWriteItemOutput, error) {
+	res, err := client.BatchWriteItem(writeInput)
+
+	if err != nil && isProvisionedThroughputException(err) {
+		for isProvisionedThroughputException(err) {
+			log.Infoln("ProvisionedThroughputExceeded exception for Write. Retrying in 5 secs")
+			time.Sleep(5 * time.Second)
+			res, err = client.BatchWriteItem(writeInput)
+		}
+	}
+	return res, err
 }

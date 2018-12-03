@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 )
@@ -16,11 +17,16 @@ type mockDynamo struct {
 	// to not have dupes we will have a map of event-id -> map of items
 	items              map[string]map[string]*dynamodb.AttributeValue
 	itemsMutex         sync.RWMutex
-	scanTableResp      []*dynamodb.ScanOutput
+	scanTableResp      []*ScanTableResp
 	describeTableResp  []*dynamodb.DescribeTableOutput
 	putItemResp        []*dynamodb.PutItemOutput
 	batchWriteItemResp []*dynamodb.BatchWriteItemOutput
 	err                []error
+}
+
+type ScanTableResp struct {
+	Err     error
+	ScanRes *dynamodb.ScanOutput
 }
 
 func (m *mockDynamo) getErr() error {
@@ -62,7 +68,7 @@ func (m *mockDynamo) Scan(input *dynamodb.ScanInput) (*dynamodb.ScanOutput, erro
 	if len(m.scanTableResp) > 1 {
 		m.scanTableResp = m.scanTableResp[1:]
 	}
-	return resp, m.getErr()
+	return resp.ScanRes, resp.Err
 }
 
 func (m *mockDynamo) BatchWriteItem(input *dynamodb.BatchWriteItemInput) (*dynamodb.BatchWriteItemOutput, error) {
@@ -94,6 +100,16 @@ func (m *mockDynamo) BatchWriteItem(input *dynamodb.BatchWriteItemInput) (*dynam
 	return resp, m.getErr()
 }
 
+func TestIsProvisionedThroughputException(t *testing.T) {
+	provThroughput := awserr.New(dynamodb.ErrCodeProvisionedThroughputExceededException, "foo", errors.New("bar"))
+	if !isProvisionedThroughputException(provThroughput) {
+		t.Fatalf("isProvisionedThroughputException should return true for an awserr with code ErrCodeProvisionedThroughputExceededException")
+	}
+	if isProvisionedThroughputException(errors.New("foobar")) {
+		t.Fatalf("isProvisionedThroughputException should return false if the error is not an awserr")
+	}
+}
+
 func TestNewTable(t *testing.T) {
 	tab := NewTable(&mockDynamo{}, "testTable")
 	if tab.Name != "testTable" {
@@ -104,16 +120,26 @@ func TestNewTable(t *testing.T) {
 func TestScan(t *testing.T) {
 	lockChan := make(chan byte, 1)
 	tab := NewTable(&mockDynamo{
-		scanTableResp: []*dynamodb.ScanOutput{
+		scanTableResp: []*ScanTableResp{
 			{
-				LastEvaluatedKey: map[string]*dynamodb.AttributeValue{
-					"something": &dynamodb.AttributeValue{},
+				ScanRes: &dynamodb.ScanOutput{
+					LastEvaluatedKey: map[string]*dynamodb.AttributeValue{
+						"something": &dynamodb.AttributeValue{},
+					},
+					Items: make([]map[string]*dynamodb.AttributeValue, 100),
 				},
-				Items: make([]map[string]*dynamodb.AttributeValue, 100),
+				Err: nil,
 			},
 			{
-				LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
-				Items:            make([]map[string]*dynamodb.AttributeValue, 10),
+				ScanRes: nil,
+				Err:     awserr.New(dynamodb.ErrCodeProvisionedThroughputExceededException, "foo", errors.New("bar")),
+			},
+			{
+				ScanRes: &dynamodb.ScanOutput{
+					LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
+					Items:            make([]map[string]*dynamodb.AttributeValue, 10),
+				},
+				Err: nil,
 			},
 		},
 	}, "face")
@@ -145,10 +171,10 @@ func TestScanPanic(t *testing.T) {
 		}
 	}()
 	tab := NewTable(&mockDynamo{
-		err: []error{errors.New("some dang error")},
-		scanTableResp: []*dynamodb.ScanOutput{
+		scanTableResp: []*ScanTableResp{
 			{
-				LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
+				ScanRes: nil,
+				Err:     errors.New("some dang error"),
 			},
 		},
 	}, "face")
@@ -158,10 +184,13 @@ func TestScanPanic(t *testing.T) {
 
 func TestPullItems(t *testing.T) {
 	tab := NewTable(&mockDynamo{
-		scanTableResp: []*dynamodb.ScanOutput{
+		scanTableResp: []*ScanTableResp{
 			{
-				LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
-				Items:            make([]map[string]*dynamodb.AttributeValue, 100),
+				ScanRes: &dynamodb.ScanOutput{
+					LastEvaluatedKey: make(map[string]*dynamodb.AttributeValue, 0),
+					Items:            make([]map[string]*dynamodb.AttributeValue, 100),
+				},
+				Err: nil,
 			},
 		},
 	}, "face")
