@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -104,4 +105,18 @@ func handleWriteProvisionedThroughput(client dynamodbiface.DynamoDBAPI, writeInp
 		}
 	}
 	return res, err
+}
+
+// ItemCount a struct for passing Item Counts between different threads
+type ItemCount struct {
+	Lock  sync.Mutex // <-- this mutex protects
+	Count int        // <-- this integer underneath
+}
+
+// NewItemCount generates an ItemCount struct at count 0
+func NewItemCount() *ItemCount {
+	return &ItemCount{
+		Lock:  sync.Mutex{},
+		Count: 0,
+	}
 }

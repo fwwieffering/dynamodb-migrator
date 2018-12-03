@@ -303,15 +303,12 @@ func TestBatchWriteItems(t *testing.T) {
 	}, "face")
 	itemChan := make(chan []map[string]*dynamodb.AttributeValue, 10)
 	makeBatches(itemChan, itemList)
-	threadChan := make(chan bool, 1)
+	close(itemChan)
+	itemCount := NewItemCount()
 	lockChan := make(chan byte, 1)
 	unprocessedItemsChan := make(chan map[string]*dynamodb.AttributeValue, 100)
-	for len(itemChan) > 0 {
-		list := <-itemChan
-		tab.BatchWriteItems(list, threadChan, lockChan, unprocessedItemsChan)
-		<-lockChan
-		<-threadChan
-	}
+	tab.BatchWriteItems(itemChan, lockChan, itemCount, "1/1", unprocessedItemsChan)
+	<-lockChan
 	if len(unprocessedItemsChan) > 2 {
 		t.Log("Unprocessed items:")
 		for len(unprocessedItemsChan) > 2 {
@@ -328,7 +325,6 @@ func TestBatchWritePanic1(t *testing.T) {
 			t.Errorf("The code did not panic")
 		}
 	}()
-	threadChan := make(chan bool, 1)
 	lockChan := make(chan byte, 1)
 	unprocessedItemsChan := make(chan map[string]*dynamodb.AttributeValue, 100)
 	items := []map[string]*dynamodb.AttributeValue{
@@ -336,6 +332,8 @@ func TestBatchWritePanic1(t *testing.T) {
 			"event-id": &dynamodb.AttributeValue{S: aws.String("some dang thing")},
 		},
 	}
+	itemChan := make(chan []map[string]*dynamodb.AttributeValue, 10)
+	makeBatches(itemChan, items)
 	tab := NewTable(&mockDynamo{
 		err: []error{errors.New("some dang error")},
 		batchWriteItemResp: []*dynamodb.BatchWriteItemOutput{
@@ -344,8 +342,8 @@ func TestBatchWritePanic1(t *testing.T) {
 			},
 		},
 	}, "face")
-
-	tab.BatchWriteItems(items, threadChan, lockChan, unprocessedItemsChan)
+	itemCount := NewItemCount()
+	tab.BatchWriteItems(itemChan, lockChan, itemCount, "1/1", unprocessedItemsChan)
 }
 
 func TestBatchWritePanic2(t *testing.T) {
@@ -354,7 +352,6 @@ func TestBatchWritePanic2(t *testing.T) {
 			t.Errorf("The code did not panic")
 		}
 	}()
-	threadChan := make(chan bool, 1)
 	lockChan := make(chan byte, 1)
 	unprocessedItemsChan := make(chan map[string]*dynamodb.AttributeValue, 100)
 	items := []map[string]*dynamodb.AttributeValue{
@@ -362,6 +359,8 @@ func TestBatchWritePanic2(t *testing.T) {
 			"event-id": &dynamodb.AttributeValue{S: aws.String("some dang thing")},
 		},
 	}
+	itemChan := make(chan []map[string]*dynamodb.AttributeValue, 10)
+	makeBatches(itemChan, items)
 	tab := NewTable(&mockDynamo{
 		err: []error{nil, errors.New("some dang error")},
 		batchWriteItemResp: []*dynamodb.BatchWriteItemOutput{
@@ -381,7 +380,8 @@ func TestBatchWritePanic2(t *testing.T) {
 		},
 	}, "face")
 
-	tab.BatchWriteItems(items, threadChan, lockChan, unprocessedItemsChan)
+	itemCount := NewItemCount()
+	tab.BatchWriteItems(itemChan, lockChan, itemCount, "1/1", unprocessedItemsChan)
 }
 
 func TestPushItems(t *testing.T) {

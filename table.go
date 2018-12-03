@@ -89,29 +89,22 @@ func (t *Table) ScanTable(shard int, totalShards int, lockChan chan byte) {
 // the number of concurrent threads is limited by the maxThreads variable
 func (t *Table) PushItems(itemChan chan []map[string]*dynamodb.AttributeValue, waitChan chan byte) {
 	lockChan := make(chan byte)
-	goroCount := 0
-	counter := 0
+	// WARNING: more than 100000 unprocessed items causes error
+	// TODO: mutex / slice instead of chan
 	unprocessedItems := make(chan map[string]*dynamodb.AttributeValue, 100000)
 
 	// limit concurrency through use of buffered channel
-	maxThreads := 30
-	concurrentThreads := make(chan bool, maxThreads)
+	maxThreads := 5
 
+	itemCounter := NewItemCount()
 	for i := 0; i < maxThreads; i++ {
-		concurrentThreads <- true
+		go t.BatchWriteItems(itemChan, lockChan, itemCounter, fmt.Sprintf("%d/%d", i+1, maxThreads), unprocessedItems)
 	}
+	cleanUpThreads("PushItems", maxThreads, lockChan)
 
-	for itemList := range itemChan {
-		goroCount++
-		counter = counter + len(itemList)
-		<-concurrentThreads
-		log.Printf("Thread %d/%d Dispatched items %d-%d for processing", maxThreads-len(concurrentThreads), maxThreads, counter-len(itemList), counter)
-		go t.BatchWriteItems(itemList, concurrentThreads, lockChan, unprocessedItems)
-	}
-	cleanUpThreads("PushItems", goroCount, lockChan)
 	close(unprocessedItems)
 	log.Printf("Cleaning up %d unprocessed items", len(unprocessedItems))
-	counter = 0
+	counter := 0
 	for i := range unprocessedItems {
 		counter++
 		log.Printf("Storing unprocessed item %d", counter)
@@ -128,38 +121,47 @@ func (t *Table) PushItems(itemChan chan []map[string]*dynamodb.AttributeValue, w
 
 // BatchWriteItems executes an aws batchWriteItems command and handles the unprocessed items
 // Unprocessed items are retried 3 times and then appended to a channel to be processed later
-func (t *Table) BatchWriteItems(items []map[string]*dynamodb.AttributeValue, concurrentThreads chan bool, lockChan chan byte, unprocessedItems chan map[string]*dynamodb.AttributeValue) {
-	input, _ := generateBatchWriteInput(t.Name, items)
-	res, batchErr := handleWriteProvisionedThroughput(t.Client, input)
-	if batchErr != nil {
-		panic(batchErr)
-	}
-	// process unprocessed items
-	// retries 3 times
-	unprocessed := res.UnprocessedItems
-	retries := 0
-	for len(unprocessed) > 0 && retries < 3 {
-		log.Infoln(fmt.Sprintf("%d unprocessed items. Processing...", len(unprocessed)))
-		res, err := handleWriteProvisionedThroughput(t.Client, &dynamodb.BatchWriteItemInput{
-			RequestItems: unprocessed,
-		})
-		unprocessed = res.UnprocessedItems
-		retries++
-		if err != nil {
-			panic(err)
+func (t *Table) BatchWriteItems(itemChan chan []map[string]*dynamodb.AttributeValue, lockChan chan byte, itemCount *ItemCount, threadID string, unprocessedItems chan map[string]*dynamodb.AttributeValue) {
+	for itemList := range itemChan {
+		// reporting
+		itemCount.Lock.Lock()
+		itemCount.Count = itemCount.Count + len(itemList)
+		beginningRange := itemCount.Count - len(itemList)
+		endRange := itemCount.Count
+		itemCount.Lock.Unlock()
+		log.Infof(fmt.Sprintf("Thread %s Dispatched items %d-%d for processing", threadID, beginningRange, endRange))
+
+		// do write
+		input, _ := generateBatchWriteInput(t.Name, itemList)
+		res, batchErr := handleWriteProvisionedThroughput(t.Client, input)
+		if batchErr != nil {
+			panic(batchErr)
 		}
-		// try not to overload tables
-		time.Sleep(1 * time.Second)
-	}
-	if retries == 3 && len(unprocessed) > 0 {
-		log.Errorln(fmt.Sprintf("Unable to process %d items. Writing them to the cleanup channel", len(unprocessed)))
-		for u := range unprocessed[t.Name] {
-			log.Infoln(fmt.Sprintf("Length of unprocessed items channel: %d", len(unprocessedItems)))
-			unprocessedItems <- unprocessed[t.Name][u].PutRequest.Item
+		// process unprocessed items
+		// retries 3 times
+		unprocessed := res.UnprocessedItems
+		retries := 0
+		for len(unprocessed) > 0 && retries < 3 {
+			log.Infoln(fmt.Sprintf("Thread %s has %d unprocessed items in items %d-%d Processing...", threadID, len(unprocessed), beginningRange, endRange))
+			res, err := handleWriteProvisionedThroughput(t.Client, &dynamodb.BatchWriteItemInput{
+				RequestItems: unprocessed,
+			})
+			unprocessed = res.UnprocessedItems
+			retries++
+			if err != nil {
+				panic(err)
+			}
+			// try not to overload tables
+			time.Sleep(1 * time.Second)
+		}
+		if retries == 3 && len(unprocessed) > 0 {
+			log.Errorln(fmt.Sprintf("Thread %s unable to process %d items in items %d-%d. Writing them to the cleanup channel", threadID, len(unprocessed), beginningRange, endRange))
+			for u := range unprocessed[t.Name] {
+				unprocessedItems <- unprocessed[t.Name][u].PutRequest.Item
+				log.Infoln(fmt.Sprintf("Length of unprocessed items channel: %d", len(unprocessedItems)))
+			}
 		}
 	}
-	// free up room for another thread
-	concurrentThreads <- true
 	// for syncing
 	lockChan <- 1
 }
